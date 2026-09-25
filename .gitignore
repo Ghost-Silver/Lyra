@@ -1,0 +1,38 @@
+# 构建产物
+build*/
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# IDE / 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# 前端 node
+node_modules/
+web/.vite/
+
+# 学习层 / 训练产物
+learning/models/*
+learning/checkpoints/*
+learning/logs/*
+*.ckpt
+*.pt
+*.bin
+
+# CTorch 本地构建
+# 置顶 CTorch 子目录的构建产物
