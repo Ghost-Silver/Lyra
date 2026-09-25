@@ -1,0 +1,3 @@
+[submodule "third_party/CTorch"]
+	path = third_party/CTorch
+	url = git@github.com:ShengFlow/CTorch.git
