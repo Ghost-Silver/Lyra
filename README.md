@@ -37,6 +37,7 @@
 ├── README.md
 ├── app/
 │   └── main.cpp              # 主程序：WebSocket 服务 + 仿真/调度主循环
+├── third_party/CTorch/       # CTorch 学习层依赖（git 子模块）
 ├── lib/arm/                  # Layer 0 实时内核（0 依赖）
 │   ├── kinematics.hpp        # DH/FK / 解析+数值 IK / 雅可比 / 奇异度量   [已建]
 │   ├── planning.hpp          # 关节 PTP / 笛卡尔直线·圆弧 / 势场避障 / 抓取编排 [已建]
@@ -63,6 +64,12 @@
 
 ## 构建
 
+> 首次克隆后先拉取子模块（CTorch 学习层依赖）：
+
+```bash
+git submodule update --init --recursive
+```
+
 ### 仅实时内核（默认，不依赖 CTorch）
 
 ```bash
@@ -74,11 +81,11 @@ cmake --build build
 ### 启用 CTorch 学习层
 
 ```bash
-cmake -B build-learn -DARM_ENABLE_CTORCH=ON -DCTORCH_ROOT="$HOME/LuoJin/CTorch-optimize-AutoDiff"
+cmake -B build-learn -DARM_ENABLE_CTORCH=ON -DCTORCH_ROOT=third_party/CTorch
 cmake --build build-learn
 ```
 
-> `CTORCH_ROOT` 指向 CTorch 仓库根；未设置时默认回退到上述路径。
+> `CTORCH_ROOT` 指向 CTorch 仓库根；未设置时默认回退到 `third_party/CTorch`（子模块）。
 
 ## 功能与设计补充点
 
@@ -110,4 +117,4 @@ cmake --build build-learn
 - [ ] 硬件接口预留
 
 ---
-团队：ShengFlow / 鹤归潮
+团队：ShengFlow / 笙歌
