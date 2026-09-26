@@ -64,8 +64,15 @@ cmake --build build-learn -j
 ### 测试
 
 ```bash
-bash tests/run_tests.sh        # Layer 0 全部（5 项）+ test_learn（若已构建）
+bash tests/run_tests.sh              # Layer 0（6 项，纯 C++ 无依赖）
+WITH_LEARN=1 bash tests/run_tests.sh # + 学习层 3 项（构建 CTorch）+ Runtime 探针
 ```
+
+`run_tests.sh` 如实分层汇总：**Layer0**（6 项）/ **Learn**（3 项：test_learn、
+test_ctorch_transpose_grad、test_train_regression）/ **Runtime**（`ws_probe.py`：第 17 连接
+503、半开连接回收、超长请求头丢弃、越限指令不变式与 `/api/health` 安全计数）。未构建且未请求 → Learn 显示
+`SKIPPED(not built)` 且退出码 0；**已构建/`WITH_LEARN=1` 却缺二进制 → FAIL 且退出码非 0**
+（不把「没跑」伪装成「通过」）。
 
 | 测试 | 覆盖 |
 | --- | --- |
@@ -73,7 +80,8 @@ bash tests/run_tests.sh        # Layer 0 全部（5 项）+ test_learn（若已�
 | `test_planning` | PTP 关节规划（**ts/qs 同步、时间戳严格单调**）、直线/圆弧笛卡儿轨迹、repel 排斥场、grasp 抓取门形轨迹（**独立抬升离开段**） |
 | `test_sim` | 单步伺服→关节收敛、速度跟踪、**关节摩擦（静摩擦死区+稳态跌落）**、**RL 基线去摩擦**、**RLEnv**（obs 归一/奖励/done/成功） |
 | `test_json_ws` | JSON 全特性往返 + **深度上限/严格数字/越界 API** 回归 + **RFC6455 帧编解码**（掩码/分片/ping/16/64 位长度、**回绕与超限帧协议错误**） |
-| `test_serial` | 帧编解码 CRC16 + 注入假串口回环 |
+| `test_serial` | 帧编解码 CRC16-CCITT + 注入假串口回环 |
+| `test_safety` | **独立安全监控层**（B1：越限目标拦截+计数、速度/加速度审计、单拍跃变、急停锁存、关闭旁路）+ **轨迹时间基准防御**（B2：空/非单调/末值≤0 轨迹拒播、t=300 s 漂移回归） |
 | `test_learn`（需 CTorch） | Linear 前向手算+解析梯度、Adam 单步手算、**logπ 图梯度 vs 有限差分**、REINFORCE 一次更新、BC 下降 |
 
 ---
@@ -89,10 +97,11 @@ bash tests/run_tests.sh        # Layer 0 全部（5 项）+ test_learn（若已�
 | `sim.hpp` | `ArmSim`：单周期 `step` = 重力矩前馈 + 位置/速度伺服 + 速度环半隐式欧拉 + **关节摩擦（库仑+粘性+静摩擦）** + 6 状态关节软限位（撞限位速度清零）；摩擦模型 `τ_f = b·qd + fc·sgn(qd)`，伺服刚度 `velKv` 折算稳态跌落 `τ_f/Kv`、`|τ_d|≤τs` 时粘滞锁定（静摩擦死区）——低速爬行/跟踪误差均为真实效应；**`RLEnv` 显式去摩擦（`rlBaseline`）保黄金回归逐位确定性**；`RLEnv`：RL 环境包装（obs 18 维：位姿误差 6（pos/0.25、rot/π）+ q/qmax 6 + qd/vmax 6；act 6 = 归一化关节速度限幅；`maxT` 时域参数、`goalConfig()` 访问器） |
 
 **奇异软降速**：`singularityScale(η)`——η ≥ **0.05** 满速，η → 0 沿 smoothstep 降至 floor 0.2；
-`isSingularNear(q, 0.02)` 供 UI/规划触发重规划。阈值按本臂 η 分布重标（3000 随机位形实测：
-p5=0.0059 / 中位 0.0753 / p95=0.1953；行归一 Lchar=0.5 m）：旧阈值 0.12 会让 **70.9%** 位形
-进入降速区，重标 0.05 后 **34.0%**——且是 smoothstep 平滑过渡（η≥0.04 时 scale≥0.92 实际近乎
-满速；深度降速仅 η<0.02 的 14.5%）。`manipulability` 返 Lchar 归一无量纲 `|det J̃|`（线部 ÷L），
+`isSingularNear(q, 0.02)` 供 UI/规划触发重规划。阈值按本臂 η 分布重标（3000 位形、关节限位内均匀采样实测，**仓内可复现**——
+`./build/tests/test_kinematics --eta-stats`（seed=20260926；见 `docs/claims-audit.md`）：
+p5=0.0054 / 中位 0.0700 / p95=0.1941；行归一 Lchar=0.5 m）：旧阈值 0.12 会让 **70.9%** 位形
+进入降速区，重标 0.05 后 **37.2%**——且是 smoothstep 平滑过渡（η≥0.04 时 scale≥0.92、
+占 **69.0%** 实际近乎满速；深度降速仅 η<0.02 的 **15.8%**）。`manipulability` 返 Lchar 归一无量纲 `|det J̃|`（线部 ÷L），
 奇异→0。
 
 **伺服律**（`ArmSim`，与 web 实时行为一致，勿改）：
@@ -107,7 +116,7 @@ p5=0.0059 / 中位 0.0753 / p95=0.1953；行归一 Lchar=0.5 m）：旧阈值 0.
 | `control_interface.hpp` | `ArmController` 接口：`enqueue(指令)`→`poll()`→`StateSnapshot`；50 Hz 控制节拍，`StateSnapshot` 含 `sigmaMin`/`sigIdx`（η）/`manip` |
 | `json.hpp` | 自含 JSON 解析/序列化（UTF-8、转义、\uXXXX、**严格 JSON 数字语法**、**嵌套深度上限 200 层**、越界安全取值 API） |
 | `ws_server.hpp` | 自含 RFC6455 服务端（握手 SHA1+Base64、帧编解码、分片、ping/pong、close）。**安全硬化**：客户端帧强制掩码、控制帧 ≤125 禁分片、孤立 Continuation 拒收、握手三件套校验（Connection/Version/Key）、单帧/消息/缓冲/连接数/发送队列全限额、slowloris 超时回收、**发送严格非阻塞**（慢客户端只被丢弃，不拖死 50 Hz 回路）、静态文件 realpath 前缀校验 + `O_NOFOLLOW`（symlink 逃逸拒绝）、Origin 白名单可选 |
-| `serial_driver.hpp` | **硬件接口预留**：`SerialDriver` 帧协议（SOF A5/长度/序号/负载类型/CRC16-IBM），`BytesSerial` 可注入假串口（测试回环）；真机路径（termios 打开 `/dev/tty*`）已留桩 |
+| `serial_driver.hpp` | **硬件接口预留**：`SerialDriver` 帧协议 `[0xAA][0x55][type:u8][len:u8][payload][crc16:u16]`（**无序号字段**；CRC16-CCITT poly 0x1021 / init 0xFFFF，覆盖 type..payload），`BytesSerial` 可注入假串口（测试回环）；真机路径（termios 打开 `/dev/tty*`）已留桩 |
 
 **协议**（浏览器 ↔ 服务端，JSON 文本帧）：
 
@@ -132,10 +141,13 @@ p5=0.0059 / 中位 0.0753 / p95=0.1953；行归一 Lchar=0.5 m）：旧阈值 0.
   单端口同服静态+WS；Origin 缺省放行（实验室工具/预览代理），`--allow-origin URL`（可重复）
   可收紧为白名单；浏览器不直连其他端口。
 
-**安全边界（PR #1 审查后）**：默认面向实验室/局域网（无认证）。已内置 DoS 硬化——
-帧/消息/缓冲/连接数/发送队列全限额、握手三件套校验、JSON 深度上限、realpath+symlink 逃逸防护、
-非阻塞发送（慢客户端不拖死控制回路）、`--allow-origin` 白名单。**公网暴露仍需**认证、WSS、
-强制 Origin 白名单与资源配额；真机前仍需独立速度/力矩饱和监控层与限位硬 clamp。
+**安全边界（PR #1 审查后）**：默认面向实验室/局域网（无认证）——完整**威胁模型、未实现
+防护清单（及其后果）、部署建议与已实现防护开关**见 **`docs/SECURITY.md`**。已内置：DoS 硬化
+（帧/消息/缓冲/连接数/请求头/发送队列全限额、握手三件套校验、JSON 深度上限、realpath+symlink
+逃逸防护、非阻塞发送——慢客户端不拖死控制回路）、**独立安全监控层**（下发前位置硬 clamp+计数、
+速度/加速度审计、单拍跃变回滚；`--safemon-estop` 可选越限急停、`--no-safemon` 关闭；计数见
+`/api/health` 的 `safety_*` 与状态 JSON 的 `safety` 对象）、轨迹时间基准拒播、`--allow-origin`
+白名单。**公网暴露仍需**认证、WSS、强制 Origin 白名单与资源配额。
 
 ## 4. 学习层 `learning/` + `ctorch_ext/`（需 `ARM_ENABLE_CTORCH=ON`）
 
@@ -151,8 +163,11 @@ p5=0.0059 / 中位 0.0753 / p95=0.1953；行归一 Lchar=0.5 m）：旧阈值 0.
 **训练验证（本仓实测）**：
 
 - test_learn 全绿：Linear/Adam 手算对照、logπ 与 loss 的图梯度 vs 有限差分吻合
-  （如 `loss-grad: analytic=-0.094902 numeric=-0.094891`）、BC loss 30 步单调下降。
-- 预训练曲线真实改善：示教 BC loss 0.34 → 0.06（60 epoch）；DAgger 后确定性策略
+  （如 `loss-grad: analytic=-0.094902 numeric=-0.094891`，**量级参考**：硬门槛是逐元素
+  吻合容差，数值随初值/seed 变化）、BC loss 单调下降。
+- 预训练曲线真实改善（**量级参考**——数值随 seed/epoch/示教集而变；仓库回归基准见
+  `tests/test_train_regression.cpp`，复现：`WITH_LEARN=1 bash tests/run_tests.sh`）：
+  示教 BC loss 0.34 → 0.06（60 epoch）；DAgger 后确定性策略
   从随机初始化的 ≈ −1200 提升到 ≈ −640（合成专家水平 −253 ~ −274，3/3 成功）。
 - REINFORCE 端到端（采样→return-to-go→EMA baseline→白化→图梯度→Adam→checkpoint/CSV）
   全通，训练曲线随 `--log` 落盘。**如实说明**：400 步量级 horizon 上 REINFORCE 的
@@ -161,8 +176,9 @@ p5=0.0059 / 中位 0.0753 / p95=0.1953；行归一 Lchar=0.5 m）：旧阈值 0.
 
 **CTorch 集成**：vendored 于 `third_party/CTorch`（v0.2.10，MIT），固定
 `CT_ENABLE_MLIR=OFF`（免 LLVM）与 `CT_ENABLE_LTO=OFF`，C3 图融合/JIT 管线在无 MLIR
-后端时编译期关闭（eager+autograd 数值等价）。**六处最小 vendored 补丁**（含一处
-**转置梯度错位的关键正确性修复**）全部记录于 `third_party/PATCHES.md`——更新依赖前必读。
+后端时编译期关闭（eager+autograd 数值等价）。**七类最小 vendored 补丁**（`ctorch-lyra.patch`
+12 文件 + `c3-lyra.patch` 2 文件；含一处**转置梯度错位的关键正确性修复**）全部记录于
+`third_party/PATCHES.md`——更新依赖前必读。
 
 ## 5. 修复工单（相对第一版工单，逐条完成）
 
@@ -182,7 +198,8 @@ p5=0.0059 / 中位 0.0753 / p95=0.1953；行归一 Lchar=0.5 m）：旧阈值 0.
 
 ## 6. 硬件接口预留
 
-`serial_driver.hpp` 帧协议（SOF/长度/序号/负载/CRC16-IBM）+ `BytesSerial` 注入测试已就绪；
+`serial_driver.hpp` 帧协议 `[0xAA][0x55][type][len][payload][crc16]`（无序号字段，
+CRC16-CCITT）+ `BytesSerial` 注入测试已就绪；
 真机接入只需实现 `SerialDriver` 的 termios open/read/write（桩已留），其余（指令打包、
 状态解包、CRC 校验）在测试中回环验证。规划的帧类型：`CMD_MOVE`/`CMD_STOP`/`CMD_RESET`/
 `STATE_FEEDBACK`/`ACK`。

@@ -19,6 +19,8 @@
 #include "arm/robot_conf.hpp"
 #include "arm/sim.hpp"
 #include "arm/trajectory.hpp"
+#include "arm/traj_player.hpp"
+#include "arm/control/safety_monitor.hpp"
 #include "arm/control/control_interface.hpp"
 #include "arm/control/json.hpp"
 #include "arm/control/ws_server.hpp"
@@ -41,7 +43,8 @@ class Scheduler {
  public:
   enum class Mode { Idle, Ptp, Cartesian, TeachPlay, Grasp };
 
-  explicit Scheduler(const RobotConf& conf) : sim_(conf), conf_(conf), gate_(conf.arm) {}
+  explicit Scheduler(const RobotConf& conf)
+      : sim_(conf), conf_(conf), gate_(conf.arm), safemon_(conf.arm) {}
 
   void tick(double dt) {
     (void)dt;  // 仿真步长由 sim 决定；调度按拍推进
@@ -58,7 +61,24 @@ class Scheduler {
         tickGrasp();
         break;
     }
-    sim_.step();
+    // ---- 安全监控层（B1）：独立终检，位于指令下发前后两端 ----
+    // ① 下发前：过滤待下发目标（位置/速度硬 clamp；监控层不信任任何规划器输出）
+    // ② 积分后：状态审计（位置越限→投影；单拍跃变→回滚；速度/加速度→计数）
+    // ③ 越限即急停（可选开关）：锁存急停并终止轨迹
+    if (safemon_.enabled()) {
+      bool wantEstop = safemon_.preDispatch(sim_, sim_.dt());
+      sim_.step();
+      wantEstop = safemon_.postStep(sim_, sim_.dt()) || wantEstop;
+      if (wantEstop && !gate_.eStop()) {
+        gate_.eStop(true);
+        sim_.setEStop(true);
+        player_.clear();
+        mode_ = Mode::Idle;
+        graspPhase_ = -1;
+      }
+    } else {
+      sim_.step();
+    }
   }
 
   void command(const json::Value& c) {
@@ -67,7 +87,7 @@ class Scheduler {
       bool on = c.get("on").asBool();
       gate_.eStop(on);
       sim_.setEStop(on);
-      if (on) { traj_ = JointTrajectory{}; mode_ = Mode::Idle; graspPhase_ = -1; }
+      if (on) { player_.clear(); mode_ = Mode::Idle; graspPhase_ = -1; }
       return;
     }
     if (gate_.eStop()) return;  // 急停锁存：只接受解除指令
@@ -88,19 +108,20 @@ class Scheduler {
       Mat4 T = readPose(c);
       std::array<double, 6> q;
       if (inverseKinematics(conf_.arm, T, sim_.state().q, q)) {
-        traj_ = JointTrajectory{};
+        player_.clear();
         mode_ = Mode::Idle;
         sim_.setJointPositionTarget(gate_.clampQ(q));
       }
     } else if (type == "joint_vel") {
       std::array<double, 6> v = readQ(c.get("qd"));
-      traj_ = JointTrajectory{};
+      player_.clear();
       mode_ = Mode::Idle;
       sim_.setJointVelocityTarget(gate_.clampV(v));
     } else if (type == "grip") {
       sim_.setGripper(c.get("g").asNumber(0.0));
     } else if (type == "reset") {
-      traj_ = JointTrajectory{};
+      player_.clear();
+      safemon_.reset();
       mode_ = Mode::Idle;
       graspPhase_ = -1;
       teach_.clear();
@@ -143,10 +164,24 @@ class Scheduler {
     st.manip = manipulability(conf_.arm, st.q);
     st.mode = modeName();
     st.teachCount = int(teach_.size());
+    const auto& sc = safemon_.counters();
+    st.safTotal = sc.total();
+    st.safPos = sc.posClamps + sc.posState;
+    st.safVel = sc.velClamps + sc.velState;
+    st.safAcc = sc.accState;
+    st.safStep = sc.stepJump;
+    st.safEstop = sc.estopTriggers;
+    st.safEnabled = safemon_.enabled();
     io.broadcastState(st);
   }
 
   void setIo(ControlInterface* io) { io_ = io; }
+  void setSafetyEnabled(bool on) { safemon_.setEnabled(on); }
+  bool safetyEnabled() const { return safemon_.enabled(); }
+  bool safetyEstopOnViolation() const { return safemon_.config().estopOnViolation; }
+  void setSafetyEstopOnViolation(bool on) { safemon_.setEstopOnViolation(on); }
+  const SafetyCounters& safetyCounters() const { return safemon_.counters(); }
+  const TrajPlayer& player() const { return player_; }
   ArmSim& sim() { return sim_; }
   const std::vector<std::array<double, 6>>& teach() const { return teach_; }
   Mode mode() const { return mode_; }
@@ -173,12 +208,31 @@ class Scheduler {
     return fromRPY(p, r, y, w);
   }
 
+  // 轨迹单一入口（B2）：时间原点只有这里能设；非法轨迹拒播并回包（不再静默跳终点）
+  bool beginTraj(const JointTrajectory& t, Mode m) {
+    std::string err;
+    if (!player_.start(t, sim_.state().t, &err)) {
+      mode_ = Mode::Idle;
+      reportError("traj_rejected", err);
+      return false;
+    }
+    mode_ = m;
+    return true;
+  }
+
+  void reportError(const std::string& reason, const std::string& detail) {
+    if (!io_) return;
+    json::Value v = json::Value::object();
+    v.set("type", json::Value("error"));
+    v.set("reason", json::Value(reason));
+    v.set("detail", json::Value(detail));
+    io_->sendToLast(v);
+  }
+
   void planPtp(const std::array<double, 6>& q0, const std::array<double, 6>& qf, double speed) {
-    traj_ = jointPTP(conf_.arm, q0, qf, sim_.dt(), speed, conf_.amax, conf_.jmax);
-    trajStartT_ = sim_.state().t;   // 轨迹时间原点（缺省 0 会让重置后 t>0 时首拍即判完成）
-    playhead_ = 0;
-    mode_ = traj_.empty() ? Mode::Idle : Mode::Ptp;
     sim_.setJointPositionTarget(q0);
+    auto t = jointPTP(conf_.arm, q0, qf, sim_.dt(), speed, conf_.amax, conf_.jmax);
+    beginTraj(t, Mode::Ptp);
   }
 
   void planTeachPlay(double speed) {
@@ -197,33 +251,19 @@ class Scheduler {
       append(jointPTP(conf_.arm, q0, qf, sim_.dt(), speed, conf_.amax, conf_.jmax));
       q0 = qf;
     }
-    traj_ = all;
-    trajStartT_ = sim_.state().t;
-    playhead_ = 0;
-    mode_ = traj_.empty() ? Mode::Idle : Mode::TeachPlay;
+    beginTraj(all, Mode::TeachPlay);
   }
 
+  // 播放：时间轴推进与插值全部委托 TrajPlayer（含校验/单调性/时间原点）
   void playTraj() {
-    if (traj_.empty()) { mode_ = Mode::Idle; return; }
-    double t = sim_.state().t - trajStartT_;
-    // 找到当前时间对应的插值关节角
-    size_t n = traj_.size();
-    if (t >= traj_.ts.back()) {
-      sim_.setJointPositionTarget(traj_.qs.back());
-      traj_ = JointTrajectory{};
-      mode_ = Mode::Idle;
-      return;
-    }
-    while (playhead_ + 1 < n && traj_.ts[playhead_ + 1] < t) playhead_++;
-    size_t i = playhead_;
-    double t0 = traj_.ts[i], t1 = traj_.ts[std::min(i + 1, n - 1)];
-    double a = (t1 > t0) ? std::clamp((t - t0) / (t1 - t0), 0.0, 1.0) : 1.0;
-    std::array<double, 6> q;
-    for (int k = 0; k < 6; k++) {
-      const auto& qs = traj_.qs;
-      q[k] = qs[i][k] + a * (qs[std::min(i + 1, n - 1)][k] - qs[i][k]);
-    }
+    std::array<double, 6> q{};
+    bool finished = false;
+    if (!player_.step(sim_.state().t, q, finished)) { mode_ = Mode::Idle; return; }
     sim_.setJointPositionTarget(gate_.clampQ(q));
+    if (finished) {
+      player_.clear();
+      mode_ = Mode::Idle;
+    }
   }
 
   void startGrasp(const json::Value& c) {
@@ -249,23 +289,19 @@ class Scheduler {
     if (!ok) return;
     graspStageIdx_ = 0;
     graspPhase_ = 0;   // 0 移动 approach，1 下降 grasp，2 闭爪等待，3 上提 leave
-    traj_ = graspStages_[0];
-    playhead_ = 0;
-    mode_ = Mode::Grasp;
+    if (!beginTraj(graspStages_[0], Mode::Grasp)) graspPhase_ = -1;
   }
 
   void tickGrasp() {
     if (graspPhase_ < 0) { mode_ = Mode::Idle; return; }
-    bool moving = !traj_.empty();
+    bool moving = player_.playing();
     if (moving) playTraj();
     if (mode_ == Mode::Idle && moving) return;  // playTraj 刚结束本拍不再推进
     if (!moving) {
       // 阶段切换
       if (graspPhase_ == 0) {          // approach 到位 → 下降
         graspPhase_ = 1;
-        traj_ = graspStages_[1];
-        playhead_ = 0;
-        mode_ = Mode::Grasp;
+        if (!beginTraj(graspStages_[1], Mode::Grasp)) graspPhase_ = -1;
       } else if (graspPhase_ == 1) {   // 下降到位 → 闭爪
         graspPhase_ = 2;
         graspWaitT_ = sim_.state().t;
@@ -273,9 +309,7 @@ class Scheduler {
       } else if (graspPhase_ == 2) {   // 等待闭合 → 上提
         if (sim_.state().t - graspWaitT_ > 0.6) {
           graspPhase_ = 3;
-          traj_ = graspStages_[2];
-          playhead_ = 0;
-          mode_ = Mode::Grasp;
+          if (!beginTraj(graspStages_[2], Mode::Grasp)) graspPhase_ = -1;
         }
       } else {                          // leave 到位
         graspPhase_ = -1;
@@ -304,9 +338,8 @@ class Scheduler {
   SafetyGate gate_;
   ControlInterface* io_ = nullptr;
   Mode mode_ = Mode::Idle;
-  JointTrajectory traj_;
-  size_t playhead_ = 0;
-  double trajStartT_ = 0;
+  TrajPlayer player_;          // 轨迹播放（时间原点唯一入口 + 校验）
+  SafetyMonitor safemon_;      // 独立安全监控层（下发前过滤 + 积分后审计）
   std::vector<std::array<double, 6>> teach_;
   // 抓取
   std::vector<JointTrajectory> graspStages_;
@@ -318,7 +351,8 @@ void printUsage() {
   std::printf(
       "用法: arm_sim [--port 8080] [--web web] [--dt 0.002] [--seed 7]\n"
       "              [--serial /dev/ttyUSB0] [--demo N] [--selftest]\n"
-      "              [--allow-origin URL]...   WS Origin 白名单（可重复；缺省放行所有）\n");
+      "              [--allow-origin URL]...   WS Origin 白名单（可重复；缺省放行所有）\n"
+      "              [--no-safemon] [--safemon-estop]  独立安全监控层开关（默认启用）\n");
 }
 
 int selftest() {
@@ -350,6 +384,8 @@ int main(int argc, char** argv) {
   std::string serialDev;
   long demoSteps = -1;
   std::vector<std::string> allowOrigins;   // WS Origin 白名单（空 = 放行所有；--allow-origin 可重复）
+  bool safemonOff = false;                 // --no-safemon：关闭独立安全监控层（默认启用）
+  bool safemonEstop = false;               // --safemon-estop：越限即急停锁存
 
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
@@ -364,6 +400,8 @@ int main(int argc, char** argv) {
     else if (a == "--serial") serialDev = next("--serial");
     else if (a == "--demo") demoSteps = std::atol(next("--demo"));
     else if (a == "--allow-origin") allowOrigins.push_back(next("--allow-origin"));
+    else if (a == "--no-safemon") safemonOff = true;
+    else if (a == "--safemon-estop") safemonEstop = true;
     else if (a == "--selftest") return selftest();
     else if (a == "-h" || a == "--help") { printUsage(); return 0; }
     else { std::fprintf(stderr, "未知参数: %s\n", a.c_str()); printUsage(); return 2; }
@@ -372,6 +410,8 @@ int main(int argc, char** argv) {
 
   RobotConf conf = RobotConf::desktop6();
   Scheduler sched(conf);
+  if (safemonOff) sched.setSafetyEnabled(false);
+  if (safemonEstop) sched.setSafetyEstopOnViolation(true);
 
   if (demoSteps >= 0) {
     // 无头演示：脚本化 PTP + 抓取，打印状态（冒烟）
@@ -401,6 +441,17 @@ int main(int argc, char** argv) {
 
   WsServer ws(port, webRoot);
   if (!allowOrigins.empty()) ws.setOriginAllowlist(std::move(allowOrigins));   // 空 = 放行所有
+  // /api/health 注入安全层计数（运维可直接 curl 监控，无需连 WS）
+  ws.setHealthExtra([&sched](json::Value& v) {
+    const auto& sc = sched.safetyCounters();
+    v.set("safety_enabled", json::Value(sched.safetyEnabled()));
+    v.set("safety_total", json::Value(double(sc.total())));
+    v.set("safety_pos", json::Value(double(sc.posClamps + sc.posState)));
+    v.set("safety_vel", json::Value(double(sc.velClamps + sc.velState)));
+    v.set("safety_acc", json::Value(double(sc.accState)));
+    v.set("safety_step", json::Value(double(sc.stepJump)));
+    v.set("safety_estop", json::Value(double(sc.estopTriggers)));
+  });
   if (!ws.begin()) {
     std::fprintf(stderr, "WS 服务启动失败 (port=%d)\n", port);
     return 1;
@@ -415,6 +466,9 @@ int main(int argc, char** argv) {
   }
   sched.setIo(&ws);
   std::printf("Lyra arm_sim 就绪: http://0.0.0.0:%d/  (ws: /ws, web: %s)\n", port, webRoot.c_str());
+  std::printf("[safety] 独立监控层 %s%s（下发前过滤 + 积分后审计；状态 JSON 含 safety 计数）\n",
+              sched.safetyEnabled() ? "启用" : "关闭",
+              sched.safetyEstopOnViolation() ? " + 越限急停" : "");
 
   using clock = std::chrono::steady_clock;
   auto next = clock::now();

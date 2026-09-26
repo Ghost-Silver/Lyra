@@ -11,6 +11,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -291,11 +292,14 @@ int main(int argc, char** argv) {
   }
 
   // checkpoint
+  // 自动创建输出目录（否则 saveCheckpoint 静默失败，checkpoint 无处可寻 → 影响可复现性）
+  std::error_code ec;
+  std::filesystem::create_directories(outDir, ec);
   std::string ck = outDir + "/policy_final.bin";
   if (!saveCheckpoint(policy, ck, episodes, ma))
-    std::fprintf(stderr, "[warn] checkpoint 写入失败（请先 mkdir -p %s）\n", outDir.c_str());
+    std::fprintf(stderr, "[warn] checkpoint 写入失败: %s\n", ck.c_str());
   else
-    std::printf("[save] %s (%zu float)\n", ck.c_str(), policy.dumpParams().size());
+    std::printf("[ckpt] %s（同种子可逐字节复现）\n", ck.c_str());
   std::printf("[done] 训练完成，日志 %s\n", logPath.c_str());
   return 0;
 }

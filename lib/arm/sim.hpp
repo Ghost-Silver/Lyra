@@ -1,7 +1,8 @@
 // lib/arm/sim.hpp — Layer 0 仿真：状态积分器 + RL 环境
 // ArmSim：速度/位置两种指令语义、一阶伺服滞后、软件限位、急停减速、
 //         关节摩擦（库仑+粘性+静摩擦，真实稳态跌落/静摩擦死区/低速爬行）、
-//         负载重力补偿钩子（经 RobotConf）、夹爪开合。
+//         负载重力补偿钩子（经 RobotConf）、夹爪开合；
+//         安全监控钩子（待下发指令可读 + 状态强制回写，供 SafetyMonitor 独立终检）。
 // RLEnv ：观测 18 = 末端位姿误差 6 + 关节角 6 + 关节角速度 6；
 //         动作 6 = 关节速度指令（语义限幅）；确定性种子、episode 终止条件、
 //         固定归一化（保证可复现）。
@@ -109,6 +110,36 @@ class ArmSim {
   }
 
   Mat4 eePose() const { return forwardKinematicsT0_6(conf_.arm, st_.q) * conf_.tool; }
+
+  // ---- 安全监控钩子（SafetyMonitor 独立终检用；不改变正常控制语义）----
+  // 待下发指令只读访问：监控层据此在「下发前」过滤越限目标。
+  const std::array<double, 6>& pendingQTarget() const { return qtarget_; }
+  const std::array<double, 6>& pendingVTarget() const { return vcmd_; }
+  bool positionMode() const { return posMode_; }
+  // 故障注入（**仅用于安全监控层的故障测试**：故意绕过积分器限幅，模拟积分器/派发失效）
+  void injectFaultState(const std::array<double, 6>& q, const std::array<double, 6>& qd) {
+    st_.q = q;
+    st_.qd = qd;
+  }
+  // 速度清零钩子：监控层发现观测速度越限时使用（不清位置）
+  void safetyZeroVelocity() {
+    st_.qd.fill(0.0);
+    vs_.fill(0.0);
+    vcmd_.fill(0.0);
+  }
+  // 状态强制回写：仅监控层使用（越限/跃变时把状态投影回安全域，并按需清零速度）
+  void applySafetyClamp(const std::array<double, 6>& q, bool zeroVelOnClamp) {
+    for (int i = 0; i < 6; i++) {
+      double c = std::clamp(q[i], conf_.arm.qmin[i], conf_.arm.qmax[i]);
+      if (zeroVelOnClamp && c != q[i]) {
+        st_.q[i] = c;
+        st_.qd[i] = 0.0;
+        vs_[i] = 0.0;
+      } else {
+        st_.q[i] = c;
+      }
+    }
+  }
 
  private:
   RobotConf conf_;

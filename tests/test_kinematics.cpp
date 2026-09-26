@@ -2,8 +2,11 @@
 // 覆盖：FK 已知位形、齐次矩阵末行回归（历史 bug）、θ1 解耦方程、
 // 解析 IK 8 分支往返、数值 IK 回归、雅可比数值校验、σ_min/可操控度、位姿误差公式。
 #include "arm/kinematics.hpp"
+#include <algorithm>
 #include <cstdio>
 #include <random>
+#include <string>
+#include <vector>
 using namespace arm;
 
 static int g_fail = 0;
@@ -17,7 +20,10 @@ static int g_fail = 0;
     }                                                                        \
   } while (0)
 
-int main() {
+int main(int argc, char** argv) {
+  bool etaStats = false;
+  for (int i = 1; i < argc; i++)
+    if (std::string(argv[i]) == "--eta-stats") etaStats = true;
   auto m = ArmModel::urStyle();
 
   // ---- 1. DH 变换末行恒为 0001（回归：历史 bug 导致链式平移丢失）----
@@ -211,6 +217,42 @@ int main() {
     CHECK(w1 < 0.1 * w2 + 1e-9, "可操控度 w 奇异=%.4f 正常=%.4f", w1, w2);
     double sc = singularityScale(m, qSing);
     CHECK(sc < 0.5 && sc >= 0.2, "奇异软降速系数 %.2f", sc);
+  }
+
+  // ---- 10. η 分布统计（README「奇异软降速」数字的复现入口；固定 seed 可复现）----
+  // 采样：各关节在**限位内**均匀（真实可达构型），3000 个位形。
+  if (etaStats) {
+    const int N = 3000;
+    std::mt19937 rng(20260926u);
+    std::vector<double> etas;
+    etas.reserve(N);
+    for (int k = 0; k < N; k++) {
+      std::array<double, 6> q{};
+      for (int i = 0; i < 6; i++) {
+        std::uniform_real_distribution<double> Ui(m.qmin[i], m.qmax[i]);
+        q[i] = Ui(rng);
+      }
+      etas.push_back(singularityIndex(m, q));
+    }
+    std::vector<double> sorted = etas;
+    std::sort(sorted.begin(), sorted.end());
+    auto pctile = [&](double p) { return sorted[size_t(p * double(N - 1))]; };
+    auto share = [&](double thr) {
+      int c = 0;
+      for (double e : etas) c += (e < thr);
+      return 100.0 * double(c) / double(N);
+    };
+    int ge04 = 0;
+    for (double e : etas) ge04 += (e >= 0.04);
+    double mean = 0;
+    for (double e : etas) mean += e;
+    mean /= double(N);
+    std::printf("[eta-stats] N=%d seed=20260926（关节限位内均匀采样）均=%.4f\n", N, mean);
+    std::printf("  p5=%.4f 中位=%.4f p95=%.4f  min=%.4f max=%.4f\n", pctile(0.05),
+                pctile(0.50), pctile(0.95), sorted.front(), sorted.back());
+    std::printf("  旧阈值 0.12 降速占比 %.1f%% | 现阈值 0.05 占比 %.1f%% | 深度降速(η<0.02) %.1f%%"
+                " | η≥0.04(scale≥0.92) %.1f%%\n",
+                share(0.12), share(0.05), share(0.02), 100.0 * double(ge04) / double(N));
   }
 
   if (g_fail == 0) std::printf("test_kinematics PASS\n");

@@ -11,12 +11,14 @@
 #pragma once
 #include "arm/control/control_interface.hpp"
 #include "arm/control/json.hpp"
+#include <functional>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -203,6 +205,8 @@ class WsServer : public ControlInterface {
 
   // P1-7：Origin 白名单（空 = 放行所有；设置后须精确匹配，"*" 条目通配）
   void setOriginAllowlist(std::vector<std::string> allow) { allowedOrigins_ = std::move(allow); }
+  // 健康检查扩展钩子：宿主可注入额外字段（如安全层计数），保持 ws_server 与业务解耦
+  void setHealthExtra(std::function<void(json::Value&)> fn) { healthExtra_ = std::move(fn); }
 
   void service(int timeoutMs) override {
     std::vector<pollfd> pfds;
@@ -260,6 +264,11 @@ class WsServer : public ControlInterface {
     broadcast(v);
   }
 
+  size_t httpClientCount() const { return clients_.size(); }
+  size_t rejectedClients() const { return rejectedClients_; }
+  size_t headerRejects() const { return headerRejects_; }
+  size_t cacheHits() const { return cacheHits_; }
+  size_t cacheMisses() const { return cacheMisses_; }
   size_t wsClientCount() const {
     size_t n = 0;
     for (auto& c : clients_) if (c.alive && c.isWs) n++;
@@ -285,6 +294,12 @@ class WsServer : public ControlInterface {
   static constexpr size_t kMaxMessage = 1 << 20;   // 重组消息 1 MiB
   static constexpr size_t kMaxBuffer = 2 << 20;    // 读缓冲 2 MiB
   static constexpr size_t kMaxSendQueue = 256 << 10;  // 每连接发送队列 256 KiB
+  // C1：静态文件走内存缓存 + 体积上限——实时控制线程内的磁盘 IO 只发生一次/文件，
+  // 且单文件读取量有硬上限（预读式缓存，避免客户端反复拉大文件造成控制回路抖动）。
+  // 上限必须 ≤ kMaxSendQueue：否则单次响应无法完整入队（会被当作慢客户端丢弃 → 截断）。
+  // 实测：直读 2 MiB 文件一次 ≈ 6.4 ms（3 倍控制周期），故大文件改为明确拒绝（413）。
+  static constexpr size_t kMaxStaticFile = 192 << 10;   // 单文件 192 KiB 上限（超出 413）
+  static constexpr size_t kMaxStaticCache = 8 << 20;    // 静态缓存总上限 8 MiB
 
   static void setNonBlock(int fd) {
     int fl = fcntl(fd, F_GETFL, 0);
@@ -295,7 +310,30 @@ class WsServer : public ControlInterface {
     while (true) {
       int fd = ::accept(listenFd_, nullptr, nullptr);
       if (fd < 0) break;
-      if (clients_.size() >= kMaxClients) { ::close(fd); continue; }   // 连接数上限（超则直接关）
+      if (clients_.size() >= kMaxClients) {
+        // C2：连接数超限——先回 503（前端/运维可感知「服务忙」）再关闭，而非静默断开
+        static const char kBusy[] =
+            "HTTP/1.1 503 Service Unavailable\r\n"
+            "Content-Type: text/plain\r\n"
+            "Content-Length: 4\r\n"
+            "Connection: close\r\n\r\nbusy";
+        ::send(fd, kBusy, sizeof(kBusy) - 1, MSG_NOSIGNAL);
+        // C2：紧接 close 会让「未读的入站请求数据」触发 RST，把上面的 503 也丢弃——
+        // 前端就感知不到「服务忙」。故：半关写端 → 非阻塞读掉请求 → 正常 FIN 关闭。
+        ::shutdown(fd, SHUT_WR);
+        {
+          int fl = ::fcntl(fd, F_GETFL, 0);
+          if (fl >= 0) ::fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+          char sink[2048];
+          for (int k = 0; k < 4; k++) {          // 上限 8 KiB / 4 次，非阻塞，绝不挂起控制线程
+            ssize_t n = ::recv(fd, sink, sizeof sink, 0);
+            if (n <= 0) break;
+          }
+        }
+        ::close(fd);
+        rejectedClients_++;
+        continue;
+      }
       setNonBlock(fd);
       int one = 1;
       ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
@@ -353,6 +391,14 @@ class WsServer : public ControlInterface {
     // 需包含完整请求头
     std::string req(c.buf.begin(), c.buf.end());
     size_t hdrEnd = req.find("\r\n\r\n");
+    // C2：请求头上限统一判定——①头未结束但已超限（拒绝 slowloris 慢慢堆）；
+    // ②头已结束但头部本身超限（此前 kMaxHttpReq 只声明未使用，超长头会当正常请求服务）
+    const size_t hdrLen = (hdrEnd == std::string::npos) ? req.size() : hdrEnd;
+    if (hdrLen > kMaxHttpReq) {
+      headerRejects_++;
+      c.alive = false;
+      return;
+    }
     if (hdrEnd == std::string::npos) return;  // 等待更多数据
     std::istringstream is(req.substr(0, hdrEnd));
     std::string method, path, ver;
@@ -423,6 +469,13 @@ class WsServer : public ControlInterface {
       json::Value v = json::Value::object();
       v.set("ok", json::Value(true));
       v.set("ws_clients", json::Value(double(wsClientCount())));
+      v.set("http_clients", json::Value(double(clients_.size())));
+      v.set("rejected_clients", json::Value(double(rejectedClients_)));   // C2：连接数超限拒绝数
+      v.set("header_rejects", json::Value(double(headerRejects_)));       // C2：超长请求头丢弃数
+      v.set("static_cache_hits", json::Value(double(cacheHits_)));
+      v.set("static_cache_misses", json::Value(double(cacheMisses_)));
+      v.set("static_cache_bytes", json::Value(double(staticCacheBytes_)));
+      if (healthExtra_) healthExtra_(v);   // 宿主注入（安全层计数等）
       respond(c, "200 OK", "application/json", v.dump());
       return;
     }
@@ -444,14 +497,39 @@ class WsServer : public ControlInterface {
       respond(c, "403 Forbidden", "text/plain", "no");
       return;
     }
+    // C1：命中缓存直接回（零磁盘 IO）；未命中读一次并缓存（受 kMaxStaticFile/Cache 约束）
+    auto it = staticCache_.find(real);
+    if (it != staticCache_.end()) {
+      cacheHits_++;
+      respond(c, "200 OK", mimeOf(rel), it->second);
+      c.alive = false;
+      return;
+    }
+    cacheMisses_++;
     int fd = ::open(real.c_str(), O_RDONLY | O_NOFOLLOW);
     if (fd < 0) { respond(c, "404 Not Found", "text/plain", "404 " + rel); return; }
-    std::ostringstream ss;
-    char tmp[4096];
-    ssize_t nr;
-    while ((nr = ::read(fd, tmp, sizeof tmp)) > 0) ss.write(tmp, nr);
+    std::string body;
+    {
+      char tmp[4096];
+      ssize_t nr;
+      bool tooBig = false;
+      while ((nr = ::read(fd, tmp, sizeof tmp)) > 0) {
+        body.append(tmp, size_t(nr));
+        if (body.size() > kMaxStaticFile) { tooBig = true; break; }   // 单文件上限（防大文件阻塞）
+      }
+      if (tooBig) {
+        ::close(fd);
+        respond(c, "413 Payload Too Large", "text/plain", "static file too large");
+        c.alive = false;
+        return;
+      }
+    }
     ::close(fd);
-    respond(c, "200 OK", mimeOf(rel), ss.str());
+    if (staticCacheBytes_ + body.size() <= kMaxStaticCache) {
+      staticCacheBytes_ += body.size();
+      staticCache_.emplace(real, body);
+    }
+    respond(c, "200 OK", mimeOf(rel), body);
     c.alive = false;  // 短连接（页面资源量小；WS 长连接走升级路径）
   }
 
@@ -560,6 +638,12 @@ class WsServer : public ControlInterface {
   int listenFd_ = -1;
   std::vector<Client> clients_;
   std::vector<json::Value> inbox_;
+  std::map<std::string, std::string> staticCache_;   // path → 内容（C1 预读缓存）
+  size_t staticCacheBytes_ = 0;
+  size_t cacheHits_ = 0, cacheMisses_ = 0;
+  size_t rejectedClients_ = 0;                        // C2：连接数超限被拒计数
+  size_t headerRejects_ = 0;                          // C2：超长请求头丢弃计数
+  std::function<void(json::Value&)> healthExtra_;     // /api/health 扩展字段
 };
 
 }  // namespace arm

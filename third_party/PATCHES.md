@@ -57,7 +57,9 @@ bash third_party/patches/apply.sh
    会把 (m,n) 布局梯度原样写进 (n,m) 叶子缓冲区——`y = x.matmul(W.t())` 这类**转置参数**
    的梯度整体错位且不报错（实测 dL/dW=[1 1 2 | 2 3 3]，正确值 [1 2 3 | 1 2 3]；
    修复后逐元素吻合有限差分）。凡经 `.t()/transpose()` 进图的可学习参数都会中招。
-   见 `build-learn/t3src.cpp` 探针（复现/回归用）。
+   回归测试：`tests/test_ctorch_transpose_grad.cpp`（正向：解析 vs 中央差分；负向：
+   历史错误值 [1 1 2 2 3 3] 必须判不通过 → 保证测试有判别力）。运行：
+   `WITH_LEARN=1 bash tests/run_tests.sh`；回退本补丁后该测试**必须 FAIL**（见 PR #1 回复实测）。
 
 ## 构建期兼容垫片（非依赖树内改动）
 

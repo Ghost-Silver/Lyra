@@ -23,6 +23,14 @@ struct StateSnapshot {
   double manip = 0;         // 可操控度
   std::string mode;         // idle / ptp / cartesian / teach / grasp ...
   int teachCount = 0;
+  // 安全监控层计数（B1）：独立终检的越限拦截/审计结果，可观测
+  int safTotal = 0;         // 全部越限计数之和
+  int safPos = 0;           // 位置类（目标夹回 + 状态越限）
+  int safVel = 0;           // 速度类（目标夹回 + 观测越限）
+  int safAcc = 0;           // 加速度类
+  int safStep = 0;          // 单拍跃变
+  int safEstop = 0;         // 急停触发次数
+  bool safEnabled = true;   // 监控层是否启用
 
   json::Value toJson() const {
     json::Value v = json::Value::object();
@@ -35,6 +43,15 @@ struct StateSnapshot {
     v.set("sig_idx", json::Value(sigIdx));
     v.set("manip", json::Value(manip));
     v.set("teach_count", json::Value(double(teachCount)));
+    json::Value saf = json::Value::object();
+    saf.set("enabled", json::Value(safEnabled));
+    saf.set("total", json::Value(double(safTotal)));
+    saf.set("pos", json::Value(double(safPos)));
+    saf.set("vel", json::Value(double(safVel)));
+    saf.set("acc", json::Value(double(safAcc)));
+    saf.set("step", json::Value(double(safStep)));
+    saf.set("estop", json::Value(double(safEstop)));
+    v.set("safety", saf);
     json::Value jq = json::Value::array();
     for (double x : q) jq.pushBack(json::Value(x));
     v.set("q", jq);
