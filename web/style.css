@@ -1,0 +1,120 @@
+/* web/style.css — Lyra 控制台 */
+:root {
+  --bg: #0e1116;
+  --panel: #171c24;
+  --card: #1d2430;
+  --line: #2a3342;
+  --text: #d8dee9;
+  --dim: #8a94a6;
+  --acc: #5ab0ff;
+  --ok: #3ddc84;
+  --warn: #ffb454;
+  --bad: #ff5252;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 "SF Mono", "Cascadia Code", Consolas, "Noto Sans SC", sans-serif;
+  display: flex;
+  flex-direction: column;
+}
+header {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+header h1 { font-size: 18px; margin: 0; letter-spacing: 2px; }
+header .sub { color: var(--dim); font-size: 12px; }
+.badge {
+  margin-left: auto;
+  padding: 2px 10px;
+  border-radius: 10px;
+  font-size: 12px;
+  background: var(--bad);
+  color: #fff;
+}
+.badge.on { background: var(--ok); }
+main { flex: 1; display: flex; min-height: 0; }
+#viewport { flex: 1; position: relative; }
+#viewport canvas { display: block; }
+#panel {
+  width: 340px;
+  overflow-y: auto;
+  padding: 10px;
+  border-left: 1px solid var(--line);
+  background: var(--panel);
+}
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+}
+.card h2 {
+  font-size: 13px;
+  margin: 0 0 8px;
+  color: var(--acc);
+  letter-spacing: 1px;
+}
+.card label { display: block; margin-top: 6px; font-size: 12px; color: var(--dim); }
+.card label.row { display: flex; align-items: center; gap: 6px; }
+#status-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 10px;
+  font-size: 12px;
+  color: var(--dim);
+}
+#status-grid b { color: var(--text); font-weight: 500; }
+.sig-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 12px; color: var(--dim); }
+.bar { flex: 1; height: 8px; border-radius: 4px; background: #10151d; overflow: hidden; }
+#sig-bar { height: 100%; width: 0%; background: var(--ok); transition: width .15s, background .3s; }
+#joints .jrow { display: grid; grid-template-columns: 34px 1fr 58px; gap: 8px; align-items: center; margin: 3px 0; }
+#joints .jrow span { color: var(--dim); font-size: 12px; }
+#joints .jrow output { text-align: right; font-size: 12px; }
+input[type="range"] { width: 100%; accent-color: var(--acc); }
+.pose-inputs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-top: 6px; }
+.pose-inputs input {
+  width: 100%;
+  background: #10151d;
+  border: 1px solid var(--line);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 4px 6px;
+  font: inherit;
+}
+button {
+  background: #263042;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 12px;
+  margin-top: 8px;
+  cursor: pointer;
+  font: inherit;
+}
+button:hover { background: #303c52; }
+.btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.btn-row button { flex: 1; margin-top: 0; }
+.card.danger { border-color: #5a2a2a; }
+.estop { background: var(--bad); color: #fff; font-weight: bold; letter-spacing: 2px; }
+.estop:hover { background: #ff6b6b; }
+.hint { color: var(--dim); font-size: 12px; margin-top: 6px; }
+textarea {
+  width: 100%;
+  height: 70px;
+  margin-top: 8px;
+  background: #10151d;
+  border: 1px solid var(--line);
+  color: var(--dim);
+  border-radius: 6px;
+  font: 11px/1.4 inherit;
+  resize: vertical;
+}
+#speed-v { margin-left: 6px; color: var(--text); }
