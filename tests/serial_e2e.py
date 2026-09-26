@@ -166,7 +166,7 @@ def main():
             vals, crc_ok = got_pos
             check(crc_ok, "CMD_POS 帧 CRC16-CCITT 校验通过")
             dev = max(abs(a - b) for a, b in zip(vals, q_cmd))
-            check(dev < 2e-3, "CMD_POS 数值与 WS 指令一致（最大偏差 %.4f rad，量化 0.001）", dev)
+            check(dev < 2e-3, "CMD_POS 数值与 WS 指令一致（最大偏差 %.4f rad，量化 0.001）" % dev)
 
         # ---- 从机回复 STATE_REP ----
         h0 = health(args.port)
