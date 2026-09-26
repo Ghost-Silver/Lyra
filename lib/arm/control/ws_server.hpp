@@ -1,9 +1,12 @@
 // lib/arm/control/ws_server.hpp — WebSocket 服务实装 (RFC6455) + 静态 HTTP
 // 自包含 socket / SHA-1 / Base64 / JSON：
-//   - HTTP GET 静态文件（web/ 目录，防路径穿越，常见 MIME）
-//   - GET /ws 升级为 WebSocket（握手 SHA-1+Base64、帧编解码、ping/pong、分片、close）
+//   - HTTP GET 静态文件（web/ 目录，realpath 前缀校验 + O_NOFOLLOW：路径穿越/symlink 逃逸均拒绝）
+//   - GET /ws 升级为 WebSocket（握手校验 Connection/Version/Key、帧编解码、ping/pong、分片、close；
+//     客户端帧强制掩码、控制帧 ≤125 禁分片、孤立 Cont 拒收、帧/消息/缓冲三重上限）
 //   - GET /api/health 健康检查
-//   - 广播机器人状态 JSON / 接收指令 JSON；Origin 全放行（实验室工具 + 预览代理兼容）
+//   - 广播机器人状态 JSON / 接收指令 JSON；Origin 默认放行（实验室工具 + 预览代理兼容），
+//     setOriginAllowlist() 可配置白名单；连接数/握手超时/发送队列全局限额
+// 发送路径严格非阻塞（有界队列 + 轮询冲刷），慢客户端只会被丢弃、绝不拖死控制回路。
 // POSIX 实现，单线程 poll() 驱动，由主循环 service() 推进。
 #pragma once
 #include "arm/control/control_interface.hpp"
@@ -17,9 +20,13 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -105,18 +112,24 @@ inline std::string encodeFrame(uint8_t opcode, const std::string& payload) {
   return f;
 }
 
-// 解析一帧；返回 true 表示消费了一帧（consumed = 帧字节数）
+// 解析一帧；返回 true 表示消费了一帧（consumed = 帧字节数）。
+// err（可选）：true = 协议错误（长度回绕/超上限/64 位长度最高位非 0）——调用方必须断连，
+// 「数据不够」与「非法帧」不可混同。单帧负载上限 kMaxFrameLen。
 struct Frame {
   bool fin = true;
+  bool masked = false;
   uint8_t opcode = 0;
   std::string payload;
 };
-inline bool tryDecodeFrame(const std::vector<uint8_t>& buf, Frame& out, size_t& consumed) {
+static constexpr uint64_t kMaxFrameLen = 1ull << 20;   // 单帧 1 MiB
+inline bool tryDecodeFrame(const std::vector<uint8_t>& buf, Frame& out, size_t& consumed,
+                           bool* err = nullptr) {
+  if (err) *err = false;
   if (buf.size() < 2) return false;
   uint8_t b0 = buf[0], b1 = buf[1];
   out.fin = (b0 & 0x80) != 0;
   out.opcode = b0 & 0x0F;
-  bool masked = (b1 & 0x80) != 0;
+  out.masked = (b1 & 0x80) != 0;
   uint64_t len = b1 & 0x7F;
   size_t pos = 2;
   if (len == 126) {
@@ -125,23 +138,36 @@ inline bool tryDecodeFrame(const std::vector<uint8_t>& buf, Frame& out, size_t& 
     pos += 2;
   } else if (len == 127) {
     if (buf.size() < pos + 8) return false;
+    if (buf[pos] & 0x80) { if (err) *err = true; return false; }   // RFC6455：最高位必 0
     len = 0;
     for (int i = 0; i < 8; i++) len = (len << 8) | buf[pos + i];
     pos += 8;
   }
+  if (len > kMaxFrameLen) { if (err) *err = true; return false; }   // 帧长上限（回绕/OOM 防护）
   uint8_t mask[4] = {0, 0, 0, 0};
-  if (masked) {
+  if (out.masked) {
     if (buf.size() < pos + 4) return false;
     for (int i = 0; i < 4; i++) mask[i] = buf[pos + i];
     pos += 4;
   }
-  if (buf.size() < pos + len) return false;
+  if (len > buf.size() - pos) return false;   // 溢出安全写法（pos ≤ buf.size() 恒成立）
   out.payload.resize(size_t(len));
   for (uint64_t i = 0; i < len; i++) {
     uint8_t c = buf[pos + i];
-    out.payload[size_t(i)] = char(masked ? (c ^ mask[i % 4]) : c);
+    out.payload[size_t(i)] = char(out.masked ? (c ^ mask[i % 4]) : c);
   }
   consumed = pos + size_t(len);
+  return true;
+}
+// 握手 key 合法性：base64(16 字节 nonce) = 恰 24 字符（含尾部 padding）
+inline bool validWsKey(const std::string& k) {
+  if (k.size() != 24) return false;
+  static const char* B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  for (size_t i = 0; i < 24; i++) {
+    char c = k[i];
+    if (i >= 22 && c == '=') continue;
+    if (!std::strchr(B64, c)) return false;
+  }
   return true;
 }
 }  // namespace wsutil
@@ -167,8 +193,16 @@ class WsServer : public ControlInterface {
     if (::bind(listenFd_, (sockaddr*)&addr, sizeof addr) < 0) return false;
     if (::listen(listenFd_, 16) < 0) return false;
     setNonBlock(listenFd_);
+    // 静态根 realpath 固定（symlink 逃逸防护基准前缀）
+    char* rp = ::realpath(webRoot_.c_str(), nullptr);
+    if (!rp) return false;
+    rootReal_ = rp;
+    std::free(rp);
     return true;
   }
+
+  // P1-7：Origin 白名单（空 = 放行所有；设置后须精确匹配，"*" 条目通配）
+  void setOriginAllowlist(std::vector<std::string> allow) { allowedOrigins_ = std::move(allow); }
 
   void service(int timeoutMs) override {
     std::vector<pollfd> pfds;
@@ -181,6 +215,14 @@ class WsServer : public ControlInterface {
       if (i - 1 >= clients_.size()) break;
       if (pfds[i].revents & (POLLIN | POLLHUP | POLLERR)) onReadable(i - 1);
     }
+    // slowloris/半帧超时：握手 5s 未齐、或 WS 读缓冲/分片挂 5s → 断开；健康空闲 WS 不杀
+    auto now = Clock::now();
+    for (auto& c : clients_) {
+      if (!c.alive) continue;
+      bool partial = !c.isWs || !c.buf.empty() || c.fragOpen;
+      if (partial && now - c.lastAct > std::chrono::seconds(5)) c.alive = false;
+    }
+    for (auto& c : clients_) if (c.alive && !c.outBuf.empty()) flushOut(c);
     // 清理死连接
     for (size_t i = clients_.size(); i-- > 0;)
       if (!clients_[i].alive) {
@@ -225,6 +267,7 @@ class WsServer : public ControlInterface {
   }
 
  private:
+  using Clock = std::chrono::steady_clock;
   struct Client {
     int fd = -1;
     bool isWs = false;
@@ -233,7 +276,15 @@ class WsServer : public ControlInterface {
     std::string frag;              // 分片续帧缓存
     bool fragOpen = false;
     uint8_t fragOp = 0;
+    std::string outBuf;            // 待发送字节（有界队列，非阻塞冲刷）
+    Clock::time_point lastAct;     // 最近一次收字节时刻（slowloris 超时用）
   };
+  // 全局限额（DoS 面收敛）
+  static constexpr size_t kMaxClients = 16;        // 连接数上限
+  static constexpr size_t kMaxHttpReq = 16 << 10;  // HTTP 请求头 16 KiB
+  static constexpr size_t kMaxMessage = 1 << 20;   // 重组消息 1 MiB
+  static constexpr size_t kMaxBuffer = 2 << 20;    // 读缓冲 2 MiB
+  static constexpr size_t kMaxSendQueue = 256 << 10;  // 每连接发送队列 256 KiB
 
   static void setNonBlock(int fd) {
     int fl = fcntl(fd, F_GETFL, 0);
@@ -244,22 +295,35 @@ class WsServer : public ControlInterface {
     while (true) {
       int fd = ::accept(listenFd_, nullptr, nullptr);
       if (fd < 0) break;
+      if (clients_.size() >= kMaxClients) { ::close(fd); continue; }   // 连接数上限（超则直接关）
       setNonBlock(fd);
       int one = 1;
       ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
       Client c;
       c.fd = fd;
+      c.lastAct = Clock::now();
       clients_.push_back(c);
     }
   }
 
-  static void sendRaw(Client& c, const std::string& bytes) {
-    size_t off = 0;
-    while (off < bytes.size()) {
-      ssize_t n = ::send(c.fd, bytes.data() + off, bytes.size() - off, MSG_NOSIGNAL);
-      if (n <= 0) { c.alive = false; return; }
-      off += size_t(n);
+  // 发送严格非阻塞：能发就发，发不完进有界队列、下轮冲刷；队列超限直接断开。
+  // 慢客户端只可能被丢弃，绝不阻塞 50Hz 控制/广播回路。
+  static void flushOut(Client& c) {
+    while (!c.outBuf.empty()) {
+      ssize_t n = ::send(c.fd, c.outBuf.data(), c.outBuf.size(), MSG_NOSIGNAL);
+      if (n > 0) { c.outBuf.erase(0, size_t(n)); continue; }
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;   // 下轮再冲
+      c.alive = false;
+      return;
     }
+  }
+  static void sendRaw(Client& c, const std::string& bytes) {
+    if (!c.alive) return;
+    flushOut(c);
+    if (!c.alive) return;
+    if (c.outBuf.size() + bytes.size() > kMaxSendQueue) { c.alive = false; return; }
+    c.outBuf += bytes;
+    flushOut(c);
   }
 
   void onReadable(size_t idx) {
@@ -275,6 +339,8 @@ class WsServer : public ControlInterface {
         return;
       }
     }
+    c.lastAct = Clock::now();
+    if (c.buf.size() > kMaxBuffer) { c.alive = false; return; }   // 读缓冲上限
     if (!c.isWs) {
       serveHttp(c);
     } else {
@@ -307,18 +373,46 @@ class WsServer : public ControlInterface {
 
     if (method != "GET") { respond(c, "405 Method Not Allowed", "text/plain", "GET only"); c.alive = false; return; }
 
-    // WS 升级
+    // WS 升级（握手三件套校验：Connection: Upgrade / Version: 13 / Key 合法）
     auto up = hdr.find("upgrade");
     if (up != hdr.end()) {
       for (auto& ch : up->second) ch = char(::tolower(ch));
       if (up->second == "websocket") {
+        auto conn = hdr.find("connection");
+        bool connOk = false;
+        if (conn != hdr.end()) {
+          for (auto& ch : conn->second) ch = char(::tolower(ch));
+          connOk = conn->second.find("upgrade") != std::string::npos;
+        }
+        auto ver = hdr.find("sec-websocket-version");
+        bool verOk = false;
+        if (ver != hdr.end()) {
+          std::string vv = ver->second;
+          while (!vv.empty() && vv.back() == ' ') vv.pop_back();
+          verOk = (vv == "13");
+        }
         auto key = hdr.find("sec-websocket-key");
-        if (key == hdr.end()) { respond(c, "400 Bad Request", "text/plain", "missing key"); c.alive = false; return; }
+        std::string keyv = key != hdr.end() ? key->second : std::string();
+        while (!keyv.empty() && keyv.back() == ' ') keyv.pop_back();
+        if (!connOk || !verOk || !wsutil::validWsKey(keyv)) {
+          respond(c, "400 Bad Request", "text/plain", "bad websocket handshake");
+          c.alive = false;
+          return;
+        }
+        // P1-7 Origin 白名单：默认（空表）放行；配置后须精确匹配（无 Origin 的非浏览器客户端放行）
+        if (!allowedOrigins_.empty()) {
+          auto org = hdr.find("origin");
+          bool okOrg = (org == hdr.end());
+          if (!okOrg)
+            for (auto& a : allowedOrigins_)
+              if (a == "*" || a == org->second) { okOrg = true; break; }
+          if (!okOrg) { respond(c, "403 Forbidden", "text/plain", "origin not allowed"); c.alive = false; return; }
+        }
         std::string resp =
             "HTTP/1.1 101 Switching Protocols\r\n"
             "Upgrade: websocket\r\n"
             "Connection: Upgrade\r\n"
-            "Sec-WebSocket-Accept: " + wsutil::acceptKey(key->second) + "\r\n\r\n";
+            "Sec-WebSocket-Accept: " + wsutil::acceptKey(keyv) + "\r\n\r\n";
         sendRaw(c, resp);
         c.isWs = true;
         return;
@@ -338,11 +432,25 @@ class WsServer : public ControlInterface {
     size_t q = rel.find('?');
     if (q != std::string::npos) rel = rel.substr(0, q);
     if (rel.find("..") != std::string::npos) { respond(c, "403 Forbidden", "text/plain", "no"); return; }
+    // P1-8：realpath 解析后强制前缀校验（symlink 逃逸如 web/link.html→/etc/passwd 一律拒绝），
+    // O_NOFOLLOW 打开兜底（目标本身是 symlink 也不跟）。
     std::string file = webRoot_ + rel;
-    std::ifstream f(file, std::ios::binary);
-    if (!f) { respond(c, "404 Not Found", "text/plain", "404 " + rel); return; }
+    char* rp = ::realpath(file.c_str(), nullptr);
+    if (!rp) { respond(c, "404 Not Found", "text/plain", "404 " + rel); return; }
+    std::string real(rp);
+    std::free(rp);
+    if (real.size() <= rootReal_.size() + 1 ||
+        real.compare(0, rootReal_.size() + 1, rootReal_ + "/") != 0) {
+      respond(c, "403 Forbidden", "text/plain", "no");
+      return;
+    }
+    int fd = ::open(real.c_str(), O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) { respond(c, "404 Not Found", "text/plain", "404 " + rel); return; }
     std::ostringstream ss;
-    ss << f.rdbuf();
+    char tmp[4096];
+    ssize_t nr;
+    while ((nr = ::read(fd, tmp, sizeof tmp)) > 0) ss.write(tmp, nr);
+    ::close(fd);
     respond(c, "200 OK", mimeOf(rel), ss.str());
     c.alive = false;  // 短连接（页面资源量小；WS 长连接走升级路径）
   }
@@ -377,13 +485,32 @@ class WsServer : public ControlInterface {
     while (true) {
       wsutil::Frame fr;
       size_t used = 0;
-      if (!wsutil::tryDecodeFrame(c.buf, fr, used)) return;
+      bool err = false;
+      if (!wsutil::tryDecodeFrame(c.buf, fr, used, &err)) {
+        if (err) c.alive = false;   // 协议错误（长度回绕/超上限）→ 断连
+        return;
+      }
       c.buf.erase(c.buf.begin(), c.buf.begin() + long(used));
 
-      // 分片重组
+      // P1-1：客户端帧必须掩码（RFC6455 MUST），裸帧即协议错误
+      if (!fr.masked) { c.alive = false; return; }
+      bool isCtl = (fr.opcode & 0x8) != 0;
+      // 保留 opcode 拒收
+      if ((fr.opcode >= 0x3 && fr.opcode <= 0x7) || (fr.opcode >= 0xB && fr.opcode <= 0xF)) {
+        c.alive = false;
+        return;
+      }
+      // P1-2：控制帧 ≤125 且禁分片
+      if (isCtl && (!fr.fin || fr.payload.size() > 125)) { c.alive = false; return; }
+      // P1-3：孤立 Continuation 拒收；分片中途改开新消息拒收
+      if (fr.opcode == wsutil::kCont && !c.fragOpen) { c.alive = false; return; }
+      if (c.fragOpen && fr.opcode != wsutil::kCont && !isCtl) { c.alive = false; return; }
+
+      // 分片重组（消息总长上限 kMaxMessage）
       std::string payload;
       uint8_t op = fr.opcode;
       if (op == wsutil::kCont) {
+        if (c.frag.size() + fr.payload.size() > kMaxMessage) { c.alive = false; return; }
         c.frag += fr.payload;
         if (fr.fin) {
           payload = c.frag;
@@ -394,6 +521,7 @@ class WsServer : public ControlInterface {
           continue;
         }
       } else if (!fr.fin && (op == wsutil::kText || op == wsutil::kBinary)) {
+        if (fr.payload.size() > kMaxMessage) { c.alive = false; return; }
         c.frag = fr.payload;
         c.fragOpen = true;
         c.fragOp = op;
@@ -427,6 +555,8 @@ class WsServer : public ControlInterface {
 
   int port_;
   std::string webRoot_;
+  std::string rootReal_;
+  std::vector<std::string> allowedOrigins_;
   int listenFd_ = -1;
   std::vector<Client> clients_;
   std::vector<json::Value> inbox_;

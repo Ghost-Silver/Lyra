@@ -86,7 +86,7 @@ int main() {
     }
     std::printf("[kin] analytic IK: %d/300 solved, avg branches %.1f\n",
                 solved, solved ? double(nsols_total) / solved : 0.0);
-    CHECK(solved >= 280, "解析 IK 覆盖率过低 %d", solved);
+    CHECK(solved >= 295, "解析 IK 覆盖率过低 %d（θ6 腕翻转修复后应 300/300）", solved);
   }
 
   // ---- 5. inverseKinematics（解析优先 + 连续性）----
@@ -103,6 +103,10 @@ int main() {
       if (inverseKinematics(m, T, cur, out)) {
         Vec3 e = poseErrorV(forwardKinematicsT0_6(m, out), T);
         CHECK(e.x < 1e-5 && e.y < 1e-5, "IK 解误差 %.2e/%.2e", e.x, e.y);
+        bool inLim = true;   // P0-补-2：返回解必须限位内（硬过滤）
+        for (int i = 0; i < 6; i++)
+          if (out[i] < m.qmin[i] - 1e-6 || out[i] > m.qmax[i] + 1e-6) inLim = false;
+        CHECK(inLim, "IK 返回越限解");
         ok++;
       }
     }
@@ -118,6 +122,26 @@ int main() {
     CHECK(numericIK(m, T, qs), "数值 IK 不收敛");
     Vec3 e = poseErrorV(forwardKinematicsT0_6(m, qs), T);
     CHECK(e.x < 1e-6 && e.y < 1e-6, "数值 IK 残差 %.2e/%.2e", e.x, e.y);
+    // P0-补-2：numericIK 每步限位投影——任何返回解不得越限（修复前 136/200 越限）
+    bool inLim = true;
+    for (int i = 0; i < 6; i++)
+      if (qs[i] < m.qmin[i] - 1e-6 || qs[i] > m.qmax[i] + 1e-6) inLim = false;
+    CHECK(inLim, "numericIK 返回越限解");
+  }
+  {
+    // 远离限位的随机扰动回归：200 次数值 IK 全部限位内
+    std::mt19937 rng(77);
+    std::uniform_real_distribution<double> U(-1.2, 1.2);
+    for (int k = 0; k < 200; k++) {
+      std::array<double, 6> q;
+      for (auto& x : q) x = U(rng);
+      Mat4 T = forwardKinematicsT0_6(m, q);
+      std::array<double, 6> qs = q;
+      for (int i = 0; i < 6; i++) qs[i] += 0.3;
+      if (!numericIK(m, T, qs)) continue;
+      for (int i = 0; i < 6; i++)
+        CHECK(qs[i] >= m.qmin[i] - 1e-6 && qs[i] <= m.qmax[i] + 1e-6, "numericIK 越限 k=%d i=%d", k, i);
+    }
   }
 
   // ---- 7. 雅可比 vs 数值微分 ----
@@ -132,7 +156,6 @@ int main() {
       Mat4 Tp = forwardKinematicsT0_6(m, qp), Tm = forwardKinematicsT0_6(m, qm);
       Vec3 dp = (Tp.translationV() - Tm.translationV()) * (1.0 / (2 * h));
       // 角速度数值差分（空间系）：vee(Ṙ Rᵀ)
-      Mat4 dR{};  // (Rp − Rm)/(2h) · Rᵀ 的反对称部分
       double Rp[3][3], Rm[3][3], R[3][3];
       for (int r = 0; r < 3; r++)
         for (int c = 0; c < 3; c++) {
@@ -141,15 +164,7 @@ int main() {
           R[r][c] = forwardKinematicsT0_6(m, q).m[r * 4 + c];
         }
       double w[3] = {0, 0, 0};
-      for (int r = 0; r < 3; r++) {
-        double acc = 0;
-        for (int a2 = 0; a2 < 3; a2++) {
-          double dRra = (Rp[r][a2] - Rm[r][a2]) / (2 * h);
-          for (int b = 0; b < 3; b++) acc += dRra * R[b][a2] * ((r == 0 && b == 1) - (r == 1 && b == 0) ? 0 : 0);
-        }
-        (void)acc;
-      }
-      // 简化：直接用 ω = vee(ṘᵀR) 的分量公式
+      // ω = vee(Ṙ Rᵀ) 的分量公式
       double dRdt[3][3];
       for (int r = 0; r < 3; r++)
         for (int c = 0; c < 3; c++) dRdt[r][c] = (Rp[r][c] - Rm[r][c]) / (2 * h);
@@ -168,7 +183,6 @@ int main() {
               "J 线部 [%d][%d]", r, j);
         CHECK(std::abs(J[3 + r][j] - w[r]) < 1e-4, "J 角部 [%d][%d]", 3 + r, j);
       }
-      (void)dR;
     }
   }
 

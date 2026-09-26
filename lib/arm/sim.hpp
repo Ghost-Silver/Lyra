@@ -1,5 +1,6 @@
 // lib/arm/sim.hpp — Layer 0 仿真：状态积分器 + RL 环境
 // ArmSim：速度/位置两种指令语义、一阶伺服滞后、软件限位、急停减速、
+//         关节摩擦（库仑+粘性+静摩擦，真实稳态跌落/静摩擦死区/低速爬行）、
 //         负载重力补偿钩子（经 RobotConf）、夹爪开合。
 // RLEnv ：观测 18 = 末端位姿误差 6 + 关节角 6 + 关节角速度 6；
 //         动作 6 = 关节速度指令（语义限幅）；确定性种子、episode 终止条件、
@@ -66,7 +67,20 @@ class ArmSim {
     for (int i = 0; i < 6; i++) {
       vwant[i] = std::clamp(vwant[i], -arm.vmax[i], arm.vmax[i]);
       vs_[i] += alpha * (vwant[i] - vs_[i]);
-      st_.qd[i] += std::clamp(vs_[i] - st_.qd[i], -dv, dv);
+      // 关节摩擦（库仑+粘性+静摩擦）：τ_f = b·qd + fc·sgn(qd)，伺服刚度 Kv 折算速度跌落
+      // vEff = vs − τ_f/Kv（速度跟踪真实稳态误差）；|τ_d|≤τs 且 qd≈0 → 粘滞锁定（静摩擦死区）。
+      // fc 参数为 0 时退化为无摩擦伺服（RL 黄金基线路径显式置零，动力学逐位不变）。
+      double v = st_.qd[i];
+      const double kVEps = 1e-3;
+      double tauF = conf_.fric.visc[i] * v;
+      double sgn = std::abs(v) > kVEps ? (v > 0 ? 1.0 : -1.0)
+                                       : std::tanh((vs_[i] - v) * conf_.velKv /
+                                                   std::max(conf_.fric.coul[i], 1e-9));
+      tauF += conf_.fric.coul[i] * sgn;
+      double vEff = vs_[i] - tauF / std::max(conf_.velKv, 1e-9);
+      double tauD = std::abs(vs_[i] - v) * conf_.velKv;
+      if (std::abs(v) < 1e-4 && tauD <= conf_.fric.stic[i]) vEff = 0.0;   // 静摩擦粘滞
+      st_.qd[i] += std::clamp(vEff - st_.qd[i], -dv, dv);
     }
     // 负载重力补偿钩子：速度前馈扰动（真机为力矩前馈，仿真以柔性扰动体现）
     st_.tau_ff = conf_.gravityCompTorque(st_.q);
@@ -120,9 +134,15 @@ class RLEnv {
   static constexpr double kPosTol = 0.02;       // 成功位置容差 (m)
   static constexpr double kRotTol = 0.15;       // 成功姿态容差 (rad)
 
+  // RL 基线动力学显式去摩擦（黄金回归逐位确定性）；仿真/控制路径用 desktop6 真实摩擦。
+  static RobotConf rlBaseline(const RobotConf& c) {
+    RobotConf r = c;
+    r.fric = JointFriction{};
+    return r;
+  }
   RLEnv(const RobotConf& conf, double dt = 0.002, int actionRepeat = 5,
         double maxT = kMaxT)
-      : sim_(conf, dt), repeat_(actionRepeat), maxT_(maxT) {}
+      : sim_(rlBaseline(conf), dt), repeat_(actionRepeat), maxT_(maxT) {}
 
   void reset(uint64_t seed, const std::array<double, 6>* start = nullptr,
              const std::array<double, 6>* goalQ = nullptr) {

@@ -69,10 +69,10 @@ bash tests/run_tests.sh        # Layer 0 全部（5 项）+ test_learn（若已�
 
 | 测试 | 覆盖 |
 | --- | --- |
-| `test_kinematics` | FK·DH·数值/解析 IK（300 随机位形）、雅可比、可操作度、**η 奇异指标**、slerp、位姿误差 |
-| `test_planning` | PTP 关节规划、直线/圆弧笛卡儿轨迹、repel 排斥场、grasp 抓取门形轨迹（含闭合+离开） |
-| `test_sim` | 单步伺服→关节收敛、速度跟踪、**RLEnv**（obs 归一/奖励/done/成功） |
-| `test_json_ws` | JSON 全特性往返 + **RFC6455 帧编解码**（掩码/分片/ping/16/64 位长度） |
+| `test_kinematics` | FK·DH·数值/解析 IK（300 随机位形，**解析 300/300、均 6.8 分支**）、**限位硬约束回归**、雅可比、可操作度、**η 奇异指标**、slerp、位姿误差 |
+| `test_planning` | PTP 关节规划（**ts/qs 同步、时间戳严格单调**）、直线/圆弧笛卡儿轨迹、repel 排斥场、grasp 抓取门形轨迹（**独立抬升离开段**） |
+| `test_sim` | 单步伺服→关节收敛、速度跟踪、**关节摩擦（静摩擦死区+稳态跌落）**、**RL 基线去摩擦**、**RLEnv**（obs 归一/奖励/done/成功） |
+| `test_json_ws` | JSON 全特性往返 + **深度上限/严格数字/越界 API** 回归 + **RFC6455 帧编解码**（掩码/分片/ping/16/64 位长度、**回绕与超限帧协议错误**） |
 | `test_serial` | 帧编解码 CRC16 + 注入假串口回环 |
 | `test_learn`（需 CTorch） | Linear 前向手算+解析梯度、Adam 单步手算、**logπ 图梯度 vs 有限差分**、REINFORCE 一次更新、BC 下降 |
 
@@ -86,11 +86,14 @@ bash tests/run_tests.sh        # Layer 0 全部（5 项）+ test_learn（若已�
 | `trajectory.hpp` | `SCurveProfile`：7 段 S 曲线速度规划，单段支持巡航、加/减速不对称、段长不足自动缩放 `vmax`；`scurvePlan` |
 | `planning.hpp` | `jointPTP`（关节空间 PTP，SCurve 整段归一化时标定）·`cartesianLineTraj`（直线位姿插值+姿态 slerp）·`circlePoses`·`repelObstacle`（球形排斥场）·`graspPlan`（下降→闭合→**抬升离开段**→门形搬运→放置）·`fromRPY/toRPY` |
 | `robot_conf.hpp` | `RobotConf::desktop6()` 桌面 6 轴参数（DH/限位/vmax/amax/jmax/PID/摩擦）·`Payload`·`gravityCompTorque`（负载重力补偿钩子） |
-| `sim.hpp` | `ArmSim`：单周期 `step` = 重力矩前馈 + 位置/速度伺服 + 速度环半隐式欧拉 + 库/静摩擦 + 6 状态关节软限位（撞限位速度清零）；`RLEnv`：RL 环境包装（obs 18 维：位姿误差 6（pos/0.25、rot/π）+ q/qmax 6 + qd/vmax 6；act 6 = 归一化关节速度限幅；`maxT` 时域参数、`goalConfig()` 访问器） |
+| `sim.hpp` | `ArmSim`：单周期 `step` = 重力矩前馈 + 位置/速度伺服 + 速度环半隐式欧拉 + **关节摩擦（库仑+粘性+静摩擦）** + 6 状态关节软限位（撞限位速度清零）；摩擦模型 `τ_f = b·qd + fc·sgn(qd)`，伺服刚度 `velKv` 折算稳态跌落 `τ_f/Kv`、`|τ_d|≤τs` 时粘滞锁定（静摩擦死区）——低速爬行/跟踪误差均为真实效应；**`RLEnv` 显式去摩擦（`rlBaseline`）保黄金回归逐位确定性**；`RLEnv`：RL 环境包装（obs 18 维：位姿误差 6（pos/0.25、rot/π）+ q/qmax 6 + qd/vmax 6；act 6 = 归一化关节速度限幅；`maxT` 时域参数、`goalConfig()` 访问器） |
 
-**奇异软降速**：`singularityScale(η)`——η ≥ 0.12 满速，η ≤ 0.02 线性降至 floor 0.2；
-`isSingularNear(q, 0.02)` 供 UI/规划触发重规划。η 阈值经本臂实测标定（行归一 Lchar=0.5 m，
-正常工作域 η≈0.02–0.26），勿照教科书硬套。`manipulability` 前向声明已于头内补全。
+**奇异软降速**：`singularityScale(η)`——η ≥ **0.05** 满速，η → 0 沿 smoothstep 降至 floor 0.2；
+`isSingularNear(q, 0.02)` 供 UI/规划触发重规划。阈值按本臂 η 分布重标（3000 随机位形实测：
+p5=0.0059 / 中位 0.0753 / p95=0.1953；行归一 Lchar=0.5 m）：旧阈值 0.12 会让 **70.9%** 位形
+进入降速区，重标 0.05 后 **34.0%**——且是 smoothstep 平滑过渡（η≥0.04 时 scale≥0.92 实际近乎
+满速；深度降速仅 η<0.02 的 14.5%）。`manipulability` 返 Lchar 归一无量纲 `|det J̃|`（线部 ÷L），
+奇异→0。
 
 **伺服律**（`ArmSim`，与 web 实时行为一致，勿改）：
 `v_want = sign(err)·min(posKp·|err|, sqrt(2·amax·|err|))`；平滑限速 `vs += α(v_want−vs)`；
@@ -102,8 +105,8 @@ bash tests/run_tests.sh        # Layer 0 全部（5 项）+ test_learn（若已�
 | 头文件 | 内容 |
 | --- | --- |
 | `control_interface.hpp` | `ArmController` 接口：`enqueue(指令)`→`poll()`→`StateSnapshot`；50 Hz 控制节拍，`StateSnapshot` 含 `sigmaMin`/`sigIdx`（η）/`manip` |
-| `json.hpp` | 自含 JSON 解析/序列化（UTF-8、转义、\uXXXX、数字、深度限制） |
-| `ws_server.hpp` | 自含 RFC6455 服务端（握手 SHA1+Base64、掩码帧、分片、ping/pong、close） |
+| `json.hpp` | 自含 JSON 解析/序列化（UTF-8、转义、\uXXXX、**严格 JSON 数字语法**、**嵌套深度上限 200 层**、越界安全取值 API） |
+| `ws_server.hpp` | 自含 RFC6455 服务端（握手 SHA1+Base64、帧编解码、分片、ping/pong、close）。**安全硬化**：客户端帧强制掩码、控制帧 ≤125 禁分片、孤立 Continuation 拒收、握手三件套校验（Connection/Version/Key）、单帧/消息/缓冲/连接数/发送队列全限额、slowloris 超时回收、**发送严格非阻塞**（慢客户端只被丢弃，不拖死 50 Hz 回路）、静态文件 realpath 前缀校验 + `O_NOFOLLOW`（symlink 逃逸拒绝）、Origin 白名单可选 |
 | `serial_driver.hpp` | **硬件接口预留**：`SerialDriver` 帧协议（SOF A5/长度/序号/负载类型/CRC16-IBM），`BytesSerial` 可注入假串口（测试回环）；真机路径（termios 打开 `/dev/tty*`）已留桩 |
 
 **协议**（浏览器 ↔ 服务端，JSON 文本帧）：
@@ -126,7 +129,13 @@ bash tests/run_tests.sh        # Layer 0 全部（5 项）+ test_learn（若已�
   导出 JSON（供 RL `--imitate` 预训练）。
 - **奇异指示条**：`sig_idx`（η）<0.02 红 / <0.06 黄 / 满宽 /0.2——无量纲、经行标定。
 - 沙盒/反代安全：WS 一律 `wss(s)://当前host/ws` 相对路径，不写死 localhost；`arm_sim`
-  单端口同服静态+WS、允许任意 Origin；浏览器不直连其他端口。
+  单端口同服静态+WS；Origin 缺省放行（实验室工具/预览代理），`--allow-origin URL`（可重复）
+  可收紧为白名单；浏览器不直连其他端口。
+
+**安全边界（PR #1 审查后）**：默认面向实验室/局域网（无认证）。已内置 DoS 硬化——
+帧/消息/缓冲/连接数/发送队列全限额、握手三件套校验、JSON 深度上限、realpath+symlink 逃逸防护、
+非阻塞发送（慢客户端不拖死控制回路）、`--allow-origin` 白名单。**公网暴露仍需**认证、WSS、
+强制 Origin 白名单与资源配额；真机前仍需独立速度/力矩饱和监控层与限位硬 clamp。
 
 ## 4. 学习层 `learning/` + `ctorch_ext/`（需 `ARM_ENABLE_CTORCH=ON`）
 
@@ -159,12 +168,13 @@ bash tests/run_tests.sh        # Layer 0 全部（5 项）+ test_learn（若已�
 
 1. ~~`planning.hpp` 缺 `<string>`~~ —— 已补，独立 TU 编译通过。
 2. ~~include 路径混乱~~ —— 统一 `-Ilib -I.`（CMake `target_include_directories`）。
-3. ~~IK 数学 bug~~ —— 数值 IK 阻尼最小二乘+限位投影；解析 IK 291/300 随机位形通过，
-   失败样本均在关节限位外/奇异邻域（有意拒绝）。
+3. ~~IK 数学 bug~~ —— 数值 IK 阻尼最小二乘 + **逐步限位投影**；解析 IK **300/300** 随机位形全通
+   （均 6.8 分支）。历史 291/300 的 9 个失败样本**均在限位内**，根因是腕翻转分支漏 `θ6+π`
+   的退化漏解（已修复，见 PR #1 审查 P0-补-1）；越限解一律**硬过滤**（不返回、不交给下游）。
 4. ~~可操作度语义~~ —— `det(J̃J̃ᵀ)` 无量纲化（线部按特征长度归一），奇异→0。
-5. ~~`graspPlan` 缺离开段~~ —— 闭合后抬升离开段 + 门形搬运 + 放置张开，测试覆盖。
+5. ~~`graspPlan` 缺离开段~~ —— 闭合后**独立抬升离开段**（高于 approach 至少 `max(approachD/2, 2cm)`，`leaveLift` 可配）+ 门形搬运 + 放置张开，测试回归覆盖。
 6. ~~死代码~~ —— 声明/定义对齐（`manipulability` 等），`-Wall -Wextra` 零警告。
-7. ~~`jointPTP` 速度~~ —— SCurve 整段归一化时标定，测试覆盖峰值速度约束。
+7. ~~`jointPTP` 速度~~ —— SCurve 整段归一化时标定，**`ts` 与 `qs` 同步写入且严格单调**（播放端按 `(ts,qs)` 时间轴推进；缺 ts 会让首拍即判完成——PR #1 审查 P0-1，已修复），测试覆盖峰值速度约束与时间戳单调性。
 8. ~~FK 热路径分配~~ —— `forwardKinematics` 可传入 scratch 缓冲复用 `Mat4`。
 9. ~~`.gitignore` 截断~~ —— 补齐（构建/IDE/前端/学习产物分类）。
 10. ~~README 与 CMake 不一致~~ —— 本文件即以当前 CMake 为准（含 `ARM_ENABLE_CTORCH`/
@@ -195,12 +205,12 @@ cmake/              GCC 12 __bf16 兼容垫片
 
 | 用途 | 命令/字段 |
 | --- | --- |
-| 启动服务 | `./build/arm_sim --port 8080`（`0.0.0.0`，任意 Origin） |
-| 关节 PTP | `{"cmd":"joint_target","q":[6],"speed":0.1…1}` |
-| 直线/拖拽 | `{"cmd":"ee_target"/"ee_drag","pos":[3],"rpy":[3]?}` |
-| 速度模式 | `{"cmd":"joint_vel","qdot":[6]}` |
-| 急停/复位 | `{"cmd":"estop","on":true}`（锁存）/ `{"cmd":"reset"}` |
+| 启动服务 | `./build/arm_sim --port 8080`（`0.0.0.0`；Origin 缺省放行，`--allow-origin` 可收紧） |
+| 关节 PTP | `{"type":"joint_target","q":[6],"speed":0.1…1}` |
+| 直线/拖拽 | `{"type":"ee_target"/"ee_drag","pos":[3],"rpy":[3]?}` |
+| 速度模式 | `{"type":"joint_vel","qd":[6]}` |
+| 急停/复位 | `{"type":"estop","on":true}`（锁存）/ `{"type":"reset"}` |
 | 示教 | `teach_add`/`teach_clear`/`teach_play`/`teach_export` |
-| 抓取 | `{"cmd":"grasp","pos":[3],"height":0.06}` |
+| 抓取 | `{"type":"grasp","pos":[3],"height":0.06}` |
 | RL 训练 | `arm_train --episodes 300 --demo 16 --imitate teach.json --log … --out …` |
 | RL checkpoint | `policy_final.bin`（size_t n + n×float）+ `.meta.json` |

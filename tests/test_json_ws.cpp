@@ -37,6 +37,29 @@ int main() {
     CHECK(Value::parse("[-2.5e3, 1e-3, 42]", n) && n.numAt(0) == -2500 && n.numAt(2) == 42, "nums");
     Value bad;
     CHECK(!Value::parse("{oops}", bad), "应拒绝坏 JSON");
+    // 严格数字语法（P2 回归）
+    CHECK(!Value::parse("1..2....3", bad), "应拒绝 1..2....3");
+    CHECK(!Value::parse("--5", bad), "应拒绝 --5");
+    CHECK(!Value::parse("1e5e5", bad), "应拒绝 1e5e5");
+    CHECK(!Value::parse("+5", bad), "应拒绝 +5");
+    CHECK(!Value::parse("01", bad), "应拒绝 01");
+    CHECK(Value::parse("1e5", bad) && bad.asNumber() == 1e5, "1e5");
+    CHECK(Value::parse("-0.5", bad) && bad.asNumber() == -0.5, "-0.5");
+    CHECK(Value::parse("0", bad) && bad.asNumber() == 0, "0");
+    // 深度限制（P0-3 回归：修复前 20 万层递归 SIGSEGV）
+    std::string deep(201, '[');
+    deep += "1";
+    deep.append(201, ']');
+    CHECK(!Value::parse(deep, bad), "201 层嵌套应拒绝");
+    std::string deep2(100, '[');
+    deep2 += "1";
+    deep2.append(100, ']');
+    CHECK(Value::parse(deep2, bad), "100 层嵌套应通过");
+    // 容器安全 API（P2 回归）
+    Value arr;
+    CHECK(Value::parse("[7]", arr) && arr[0].asNumber() == 7, "arr[0]");
+    CHECK(arr[5].isNull(), "operator[] 越界应 Null");
+    CHECK(arr.get("zz").isNull(), "get() 缺键应 Null");
   }
 
   // ---- 2. SHA1 / Base64 已知向量 ----
@@ -82,6 +105,33 @@ int main() {
     std::string lf = wsutil::encodeFrame(wsutil::kBinary, longp);
     std::vector<uint8_t> lbuf(lf.begin(), lf.end());
     CHECK(wsutil::tryDecodeFrame(lbuf, fr, used) && fr.payload.size() == 200, "长帧");
+    CHECK(!fr.masked, "服务器帧应无掩码");
+
+    // P0-2 回归：64 位长度回绕 / 超上限帧 → 协议错误（err），且非「数据不够」
+    std::string ov;
+    ov += char(0x82);
+    ov += char(0x7F);
+    ov += char(0x80);                       // 最长度最高位 1 → 协议错误
+    for (int i = 0; i < 7; i++) ov += char(0);
+    std::vector<uint8_t> obuf(ov.begin(), ov.end());
+    bool err = false;
+    CHECK(!wsutil::tryDecodeFrame(obuf, fr, used, &err) && err, "64 位长度最高位应协议错误");
+    std::string ov2;
+    ov2 += char(0x82);
+    ov2 += char(0x7F);
+    ov2 += char(0x7F);                      // len = 2^63−1（MSB 0，通过最高位检查）
+    for (int i = 0; i < 7; i++) ov2 += char(0xFF);
+    std::vector<uint8_t> obuf2(ov2.begin(), ov2.end());
+    err = false;
+    CHECK(!wsutil::tryDecodeFrame(obuf2, fr, used, &err) && err, "超上限长帧应协议错误（resize OOM/回绕防护）");
+    // 数据不足 ≠ 协议错误
+    std::string pv;
+    pv += char(0x82);
+    pv += char(0x7E);
+    pv += char(0x01);                       // 声明 382 字节，只给 2 字节头
+    std::vector<uint8_t> pbuf(pv.begin(), pv.end());
+    err = false;
+    CHECK(!wsutil::tryDecodeFrame(pbuf, fr, used, &err) && !err, "半帧应等待且非协议错误");
   }
 
   if (g_fail == 0) std::printf("test_json_ws PASS\n");

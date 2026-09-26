@@ -118,6 +118,13 @@ class Scheduler {
       exportDemo();
     } else if (type == "grasp") {
       startGrasp(c);
+    } else {
+      // 未知指令显式报错（不再静默丢弃——客户端必须能感知拼写/协议错误）
+      json::Value v = json::Value::object();
+      v.set("type", json::Value("error"));
+      v.set("reason", json::Value("unknown_cmd"));
+      v.set("cmd", json::Value(type));
+      if (io_) io_->sendToLast(v);
     }
   }
 
@@ -168,6 +175,7 @@ class Scheduler {
 
   void planPtp(const std::array<double, 6>& q0, const std::array<double, 6>& qf, double speed) {
     traj_ = jointPTP(conf_.arm, q0, qf, sim_.dt(), speed, conf_.amax, conf_.jmax);
+    trajStartT_ = sim_.state().t;   // 轨迹时间原点（缺省 0 会让重置后 t>0 时首拍即判完成）
     playhead_ = 0;
     mode_ = traj_.empty() ? Mode::Idle : Mode::Ptp;
     sim_.setJointPositionTarget(q0);
@@ -190,6 +198,7 @@ class Scheduler {
       q0 = qf;
     }
     traj_ = all;
+    trajStartT_ = sim_.state().t;
     playhead_ = 0;
     mode_ = traj_.empty() ? Mode::Idle : Mode::TeachPlay;
   }
@@ -308,7 +317,8 @@ class Scheduler {
 void printUsage() {
   std::printf(
       "用法: arm_sim [--port 8080] [--web web] [--dt 0.002] [--seed 7]\n"
-      "              [--serial /dev/ttyUSB0] [--demo N] [--selftest]\n");
+      "              [--serial /dev/ttyUSB0] [--demo N] [--selftest]\n"
+      "              [--allow-origin URL]...   WS Origin 白名单（可重复；缺省放行所有）\n");
 }
 
 int selftest() {
@@ -339,6 +349,7 @@ int main(int argc, char** argv) {
   uint64_t seed = 7;
   std::string serialDev;
   long demoSteps = -1;
+  std::vector<std::string> allowOrigins;   // WS Origin 白名单（空 = 放行所有；--allow-origin 可重复）
 
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
@@ -352,6 +363,7 @@ int main(int argc, char** argv) {
     else if (a == "--seed") seed = uint64_t(std::atoll(next("--seed")));
     else if (a == "--serial") serialDev = next("--serial");
     else if (a == "--demo") demoSteps = std::atol(next("--demo"));
+    else if (a == "--allow-origin") allowOrigins.push_back(next("--allow-origin"));
     else if (a == "--selftest") return selftest();
     else if (a == "-h" || a == "--help") { printUsage(); return 0; }
     else { std::fprintf(stderr, "未知参数: %s\n", a.c_str()); printUsage(); return 2; }
@@ -388,6 +400,7 @@ int main(int argc, char** argv) {
   }
 
   WsServer ws(port, webRoot);
+  if (!allowOrigins.empty()) ws.setOriginAllowlist(std::move(allowOrigins));   // 空 = 放行所有
   if (!ws.begin()) {
     std::fprintf(stderr, "WS 服务启动失败 (port=%d)\n", port);
     return 1;

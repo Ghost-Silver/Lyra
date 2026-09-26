@@ -296,15 +296,21 @@ inline std::array<double, 6> eigenSymmetric6(double A0[6][6]) {
 }
 
 // ---------- 奇异性度量 ----------
-// Yoshikawa 可操控度 w = sqrt(det(J Jᵀ)) = |det J|
+// 可操控度（无量纲）：w̃ = sqrt(det(J̃J̃ᵀ)) = |det J̃|，J̃ 为 Lchar 归一后的无量纲雅可比
+// （线速度行 ÷ Lchar、角速度行不变，与 singularityIndex 同一行标定）。量纲 [1]。
 inline double manipulability(const ArmModel& arm, const std::array<double, 6>& q) {
+  constexpr double Lchar = 0.5;   // 特征长度 = 半臂展 (m)，与 singularityIndex 一致
   double J[6][6];
   buildJacobian(arm, q, J);
   double JJt[6][6]{};
   for (int r = 0; r < 6; r++)
     for (int c = 0; c < 6; c++) {
       double acc = 0;
-      for (int k = 0; k < 6; k++) acc += J[r][k] * J[c][k];
+      for (int k = 0; k < 6; k++) {
+        double jr = (r < 3 ? J[r][k] / Lchar : J[r][k]);
+        double jc = (c < 3 ? J[c][k] / Lchar : J[c][k]);
+        acc += jr * jc;
+      }
       JJt[r][c] = acc;
     }
   return std::sqrt(std::abs(det6(JJt)));
@@ -353,9 +359,11 @@ inline bool isSingularNear(const ArmModel& arm, const std::array<double, 6>& q,
   return singularityIndex(arm, q) < threshold;
 }
 
-// 奇异软处理系数：η 平滑降速 (0.2..1)，接近奇异时末端减速
+// 奇异软处理系数：η 平滑降速 (floor..1)，接近奇异时末端减速。
+// etaFull 按本臂 η 分布重标（3000 随机位形实测 p5=0.0059/中位 0.0753/p95=0.1953）：
+// 0.12 会让 70.9% 位形进入降速区 → 0.05 后 34.0%，且 smoothstep 平滑（η≥0.04 时 scale≥0.92）。
 inline double singularityScale(const ArmModel& arm, const std::array<double, 6>& q,
-                               double etaFull = 0.12, double floorScale = 0.2) {
+                               double etaFull = 0.05, double floorScale = 0.2) {
   double u = singularityIndex(arm, q);
   if (u >= etaFull) return 1.0;
   if (u <= 1e-9) return floorScale;
@@ -422,12 +430,16 @@ inline bool numericIK(const ArmModel& arm, const Mat4& target,
     }
     std::array<double, 6> dq{};
     if (!solveLinear6(A, rhs, dq.data())) return false;
-    for (int i = 0; i < 6; i++) q[i] += dq[i];
+    for (int i = 0; i < 6; i++)
+      q[i] = std::clamp(q[i] + dq[i], arm.qmin[i], arm.qmax[i]);   // 关节限位投影（每步迭代）
   }
-  // 迭代耗尽：按最终误差判成败（宽松一档）
+  // 迭代耗尽：按最终误差判成败（宽松一档）；越限解一律不接受
   Mat4 cur = forwardKinematicsT0_6(arm, q);
   Vec3 err = poseErrorV(cur, target);
-  return err.x < 1e-6 && err.y < 1e-6;
+  bool inLim = true;
+  for (int i = 0; i < 6; i++)
+    if (q[i] < arm.qmin[i] - 1e-6 || q[i] > arm.qmax[i] + 1e-6) inLim = false;
+  return err.x < 1e-6 && err.y < 1e-6 && inLim;
 }
 
 // ---------- 解析 IK（闭式 8 分支） ----------
@@ -516,6 +528,7 @@ inline int analyticIKAll(const ArmModel& arm, const Mat4& target,
         th5 = std::atan2(s5, c5);
         if (std::abs(s5) > 1e-8) {
           th6 = std::atan2(-M[2][1], M[2][0]);
+          if (sig == 1) th6 += kPi;   // 腕翻转分支：z4 取反翻转 R06 的 x6/y6 平面，θ6 补 π
         } else {
           // 腕奇异：θ4 已由 z4 定死，θ6 从剩余自由度闭式解
           double c5s = c5 >= 0 ? 1.0 : -1.0;      // θ5 = 0 或 π
@@ -563,14 +576,14 @@ inline bool analyticIK(const ArmModel& arm, const Mat4& target,
       if (s[i] < arm.qmin[i] - 1e-6 || s[i] > arm.qmax[i] + 1e-6) ok = false;
       dev += std::abs(s[i] - cur[i]);
     }
-    double score = dev + (ok ? 0.0 : 100.0);     // 软偏好限位内
-    if (score < best) { best = score; out = s; found = true; }
+    if (!ok) continue;                           // 限位硬过滤：越限解一律不返回
+    if (dev < best) { best = dev; out = s; found = true; }
   }
-  return found;
+  return found;                                  // 无合规候选 → false（宁缺勿滥）
 }
 
 // 统一 IK 入口：解析优先（全分支 + 连续性择优），失败回退多初值数值 IK，
-// 全部解经 FK 自校验，返回限位内且误差最小的解。
+// 全部解经 FK 自校验；限位为硬约束——越限解一律过滤，全越限时返回 false。
 inline bool inverseKinematics(const ArmModel& arm, const Mat4& target,
                               const std::array<double, 6>& cur,
                               std::array<double, 6>& out) {
@@ -584,8 +597,15 @@ inline bool inverseKinematics(const ArmModel& arm, const Mat4& target,
     for (auto& s : sols) cands.push_back({s, 0.0, true});
   }
 
-  // 数值多初值（确定性扰动）
-  if (cands.empty()) {
+  // 数值多初值（确定性扰动）：解析无解 **或全越限** 时回退（numericIK 自带限位投影）
+  bool hasOk = false;
+  for (auto& c : cands) {
+    bool ok = true;
+    for (int i = 0; i < 6; i++)
+      if (c.q[i] < arm.qmin[i] - 1e-6 || c.q[i] > arm.qmax[i] + 1e-6) ok = false;
+    if (ok) { hasOk = true; break; }
+  }
+  if (!hasOk) {
     std::vector<std::array<double, 6>> seeds;
     seeds.push_back(cur);
     const std::array<std::array<double, 6>, 6> pert{{
@@ -619,11 +639,12 @@ inline bool inverseKinematics(const ArmModel& arm, const Mat4& target,
       if (c.q[i] < arm.qmin[i] - 1e-6 || c.q[i] > arm.qmax[i] + 1e-6) ok = false;
       dev += std::abs(c.q[i] - cur[i]);
     }
+    if (!ok) continue;                           // 限位硬过滤：越限解一律不返回
     Vec3 err = poseErrorV(forwardKinematicsT0_6(arm, c.q), target);
-    double score = dev + 100.0 * (ok ? 0.0 : 1.0) + 10.0 * (err.x + err.y);
+    double score = dev + 10.0 * (err.x + err.y);
     if (score < best) { best = score; out = c.q; found = true; }
   }
-  return found;
+  return found;                                  // 全部越限 → false
 }
 
 }  // namespace arm

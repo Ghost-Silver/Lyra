@@ -51,6 +51,30 @@ int main() {
     CHECK(std::abs(sim.state().qd[0]) < 1e-3, "急停未停稳 %.4f", sim.state().qd[0]);
   }
 
+  // ---- 3b. 关节摩擦（P0-补-3）：静摩擦死区 + 稳态跌落 ----
+  {
+    ArmSim sim(conf, 0.002);
+    // 静摩擦死区：|vs|·Kv ≤ τs 的速度指令不产生运动（粘滞锁定）
+    std::array<double, 6> v{};
+    v[0] = 0.005;   // τd = 0.005·5 = 0.025 < τs = 0.16
+    sim.setJointVelocityTarget(v);
+    for (int i = 0; i < 1000; i++) sim.step();
+    CHECK(std::abs(sim.state().qd[0]) < 1e-4, "静摩擦死区内应粘滞 qd=%.6f", sim.state().qd[0]);
+    CHECK(std::abs(sim.state().q[0] - conf.home[0]) < 1e-4, "静摩擦死区内不应爬行");
+    // 库仑+粘性摩擦 → 速度跟踪稳态跌落（sim2real 真实效应）
+    v[0] = 2.0;
+    sim.setJointVelocityTarget(v);
+    for (int i = 0; i < 600; i++) sim.step();   // 600 步内不顶限位墙（qmax=2.967）
+    double qd = std::abs(sim.state().qd[0]);
+    CHECK(qd > 0.5 && qd < 2.0 - 0.02, "应有摩擦稳态跌落 qd=%.4f（指令 2.0）", qd);
+  }
+
+  // ---- 3c. RL 基线去摩擦（黄金回归前提）----
+  {
+    auto rlc = RLEnv::rlBaseline(conf);
+    CHECK(rlc.fric.coul[0] == 0 && rlc.fric.visc[0] == 0 && rlc.fric.stic[0] == 0, "RL 基线应无摩擦");
+  }
+
   // ---- 4. 重力补偿钩子 ----
   {
     RobotConf c2 = conf;

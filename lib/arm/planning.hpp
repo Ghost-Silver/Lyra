@@ -61,9 +61,11 @@ inline JointTrajectory jointPTP(const ArmModel& arm,
   if (T < 1e-12) n = 1;
   res.ts.resize(n);
   res.qs.resize(n);
-  // prof.s(t) 已含位移符号
+  // prof.s(t) 已含位移符号；ts 与 qs 必须同步写入——播放端按 (ts,qs) 对做时间轴
+  // 推进/插值/完成判定（t >= ts.back()），ts 缺失会让 n>1 的轨迹在首个控制周期即判完成。
   for (int i = 0; i < n; i++) {
     double t = std::min(double(i) * dt, T);
+    res.ts[i] = t;
     for (int k = 0; k < 6; k++) res.qs[i][k] = q0[k] + prof[k].s(t);
   }
   return res;
@@ -125,7 +127,8 @@ inline JointTrajectory cartesianLineTraj(const ArmModel& arm,
                                          const Mat4& T0, const Mat4& Tf,
                                          const std::array<double, 6>& ikCurrent,
                                          double dt = 0.002, double vLin = 0.12,
-                                         double aLin = 0.6, double jLin = 3.0) {
+                                         double aLin = 0.6, double jLin = 3.0,
+                                         double amaxJoint = 4.0) {
   JointTrajectory res;
   Vec3 pa = T0.translationV(), pb = Tf.translationV();
   double dist = (pb - pa).norm();
@@ -137,6 +140,12 @@ inline JointTrajectory cartesianLineTraj(const ArmModel& arm,
   double T = law.T;
   int n = std::max(2, (int)std::ceil(T / dt) + 1);
 
+  // 契约：输出 (ts, qs) 是**完整时间重参数化**后的分段线性关节轨迹——qs[i] 是到达时刻
+  // ts[i] 的路点，段内速度 = |Δq|/Δts（限速见下）。播放端必须按 ts 域插值（main.cpp playTraj
+  // 即如此），禁止按未缩放的路径时刻 i·dt 索引。路点按路径时刻均匀采样，时间轴经 ①奇异性
+  // 降速 ②关节限速 ③加速度一致 三重拉伸后自洽：任一段平均速度 ≤ vmax，相邻段平均速度跳变
+  // 受 amax 约束（dti ≥ |Δv|/amax 不动点一次即得，只依赖已定稿的前段）。限位为硬约束：
+  // inverseKinematics 已过滤越限解，任一路点无合规解即返回空。
   std::array<double, 6> q = ikCurrent;
   res.ts.resize(n);
   res.qs.resize(n);
@@ -151,19 +160,35 @@ inline JointTrajectory cartesianLineTraj(const ArmModel& arm,
     std::array<double, 6> qnew;
     if (!inverseKinematics(arm, Tw, q, qnew)) return {};
     if (i > 0) {
-      // ② 关节限速下限
-      double dtq = 0;
-      for (int k = 0; k < 6; k++)
+      // ② 关节限速下限：段平均速度 ≤ vmax
+      double dtq = 0, dqa = 0;
+      for (int k = 0; k < 6; k++) {
         dtq = std::max(dtq, std::abs(qnew[k] - res.qs[i - 1][k]) / std::max(arm.vmax[k], 1e-6));
+        dqa = std::max(dqa, std::sqrt(2.0 * std::abs(qnew[k] - res.qs[i - 1][k]) /
+                                     std::max(amaxJoint, 1e-6)));
+      }
       // ① 奇异软处理：降速 → 时间膨胀
       double sc = singularityScale(arm, qnew);
-      double dti = std::max(double(dt), dtq) / std::max(sc, 0.05);
+      double dti = std::max({double(dt), dtq, dqa}) / std::max(sc, 0.05);
+      // ③ 加速度一致：相邻段平均速度跳变 |Δv| ≤ amax·dti（依赖已定稿前段，一次成型）
+      if (i > 1) {
+        double dtPrev = ts_raw[i - 1] - ts_raw[i - 2];
+        double need = 0;
+        for (int k = 0; k < 6; k++) {
+          double vPrev = (res.qs[i - 1][k] - res.qs[i - 2][k]) / std::max(dtPrev, 1e-9);
+          double vCur = (qnew[k] - res.qs[i - 1][k]) / std::max(dti, 1e-9);
+          need = std::max(need, std::abs(vCur - vPrev) / std::max(amaxJoint, 1e-6));
+        }
+        dti = std::max(dti, need);
+      }
       t_acc += dti;
     }
     ts_raw[i] = t_acc;
     res.qs[i] = qnew;
     q = qnew;
   }
+  for (int i = 1; i < n; i++)       // 严格单调（完成判定/插值除法的前提）
+    if (ts_raw[i] <= ts_raw[i - 1]) ts_raw[i] = ts_raw[i - 1] + 1e-6;
   res.ts = ts_raw;
   return res;
 }
@@ -190,13 +215,17 @@ struct GraspPlan {
 };
 inline GraspPlan graspPlan(const Vec3& objectPos, double objectHeight,
                            double approachD, double gripperZ,
-                           const Mat4& baseOrientation) {
+                           const Mat4& baseOrientation, double leaveLift = -1.0) {
   GraspPlan gp;
   Vec3 top = objectPos + Vec3{0, 0, objectHeight};
   double r, p, y; toRPY(baseOrientation, r, p, y);
   Mat4 approach = fromRPY(top + Vec3{0, 0, approachD}, r, p, y);   // 末端悬停于物体上方
   Mat4 grasp    = fromRPY(top - Vec3{0, 0, gripperZ}, r, p, y);    // 下降到抓取位
-  Mat4 leave    = fromRPY(top + Vec3{0, 0, approachD}, r, p, y);   // 抓住后原路上提离开
+  // 离开段：闭合后抬升至 approach 之上（默认额外抬升 approachD/2，至少 2cm），
+  // 与 approach 严格区分——旧版 leave == approach 只是原路退回、无独立离开段。
+  // 抬升量 leaveLift 可配（>=0 直接生效；<0 取默认）。门形搬运以此为净空起点。
+  double lift = leaveLift >= 0 ? leaveLift : std::max(0.5 * approachD, 0.02);
+  Mat4 leave = fromRPY(top + Vec3{0, 0, approachD + lift}, r, p, y);
   gp.targets = {approach, grasp, leave};
   gp.names = {"approach", "grasp", "leave"};
   return gp;

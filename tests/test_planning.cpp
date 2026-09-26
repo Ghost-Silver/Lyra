@@ -75,6 +75,10 @@ int main() {
     std::array<double, 6> qf{1.2, -2.0, 0.4, 1.9, -1.1, 2.3};
     auto traj = jointPTP(m, q0, qf, 0.002, 1.0, 4.0, 30.0);
     CHECK(!traj.empty(), "PTP 空");
+    // P0-1 回归：ts 必须随 qs 写入（修复前全 0 → 播放端首拍即判完成）
+    CHECK(traj.ts[0] == 0 && traj.ts.back() > 0.5, "PTP 时间戳异常 back=%.4f", traj.ts.back());
+    for (size_t i = 1; i < traj.size(); i++)
+      CHECK(traj.ts[i] > traj.ts[i - 1], "PTP ts 非严格单调 @%zu", i);
     for (int k = 0; k < 6; k++)
       CHECK(std::abs(traj.qs.back()[k] - qf[k]) < 1e-9, "PTP 终点偏差 k=%d", k);
     double peak[6] = {};
@@ -137,6 +141,10 @@ int main() {
           "抓取段命名错");
     CHECK(gp.targets[0].translationV().z > gp.targets[1].translationV().z, "approach 应高于 grasp");
     CHECK(gp.targets[2].translationV().z > gp.targets[1].translationV().z, "leave 应高于 grasp");
+    // 工单 5 回归：leave 必须是独立离开段（抬升至 approach 之上），不得与 approach 重合
+    CHECK(gp.targets[2].translationV().z > gp.targets[0].translationV().z + 1e-6,
+          "leave 应高于 approach（真离开段），z_leave=%.4f z_approach=%.4f",
+          gp.targets[2].translationV().z, gp.targets[0].translationV().z);
 
     // fromRPY/toRPY 往返
     double r = 0.3, p = -0.5, y = 1.2;

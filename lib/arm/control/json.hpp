@@ -53,7 +53,11 @@ class Value {
     if (isObject()) return obj_.size();
     return 0;
   }
-  const Value& operator[](size_t i) const { return arr_[i]; }
+  // 数组取值：越界返回共享 Null（const 引用安全），禁止 UB
+  const Value& operator[](size_t i) const {
+    static const Value nullv;
+    return i < arr_.size() ? arr_[i] : nullv;
+  }
   Value& pushBack(Value v) { arr_.push_back(std::move(v)); return *this; }
 
   void set(const std::string& k, Value v) {
@@ -65,7 +69,7 @@ class Value {
     return false;
   }
   const Value& get(const std::string& k) const {
-    static Value nullv;
+    static const Value nullv;   // const：杜绝经 const_cast 误写的共享可变状态
     for (auto& p : obj_) if (p.first == k) return p.second;
     return nullv;
   }
@@ -224,7 +228,9 @@ class Value {
     return false;
   }
 
-  static bool parseValue(const std::string& t, size_t& p, Value& out) {
+  static constexpr int kMaxParseDepth = 200;   // 嵌套深度上限（真·深度限制；防深层嵌套爆栈）
+  static bool parseValue(const std::string& t, size_t& p, Value& out, int depth = 0) {
+    if (depth > kMaxParseDepth) return false;
     skipWS(t, p);
     if (p >= t.size()) return false;
     char c = t[p];
@@ -239,7 +245,7 @@ class Value {
       if (p < t.size() && t[p] == ']') { p++; return true; }
       while (true) {
         Value e;
-        if (!parseValue(t, p, e)) return false;
+        if (!parseValue(t, p, e, depth + 1)) return false;
         out.pushBack(std::move(e));
         skipWS(t, p);
         if (p < t.size() && t[p] == ',') { p++; continue; }
@@ -260,7 +266,7 @@ class Value {
         if (p >= t.size() || t[p] != ':') return false;
         p++;
         Value v;
-        if (!parseValue(t, p, v)) return false;
+        if (!parseValue(t, p, v, depth + 1)) return false;
         out.set(k, std::move(v));
         skipWS(t, p);
         if (p < t.size() && t[p] == ',') { p++; continue; }
@@ -268,16 +274,28 @@ class Value {
         return false;
       }
     }
-    // number
+    // number：严格 JSON 语法  -?(0|[1-9][0-9]*)(''.''[0-9]+)?([eE][+-]?[0-9]+)?
+    // （拒绝 1..2 / --5 / 1e5e5 / +5 / 01 / 尾部垃圾——strtod 的宽松吸收不再放行）
     size_t start = p;
-    if (t[p] == '-') p++;
-    bool any = false;
-    while (p < t.size() && (std::isdigit((unsigned char)t[p]) || t[p] == '.' || t[p] == 'e' ||
-                            t[p] == 'E' || t[p] == '+' || t[p] == '-')) {
-      if (std::isdigit((unsigned char)t[p]) || t[p] == '.') any = true;
-      p++;
+    if (p < t.size() && t[p] == '-') p++;
+    if (p >= t.size() || !std::isdigit((unsigned char)t[p])) return false;
+    if (t[p] == '0') {
+      p++;                                        // 0 之后不得再接数字（拒绝 01）
+      if (p < t.size() && std::isdigit((unsigned char)t[p])) return false;
+    } else {
+      while (p < t.size() && std::isdigit((unsigned char)t[p])) p++;
     }
-    if (!any) return false;
+    if (p < t.size() && t[p] == '.') {
+      p++;
+      if (p >= t.size() || !std::isdigit((unsigned char)t[p])) return false;
+      while (p < t.size() && std::isdigit((unsigned char)t[p])) p++;
+    }
+    if (p < t.size() && (t[p] == 'e' || t[p] == 'E')) {
+      p++;
+      if (p < t.size() && (t[p] == '+' || t[p] == '-')) p++;
+      if (p >= t.size() || !std::isdigit((unsigned char)t[p])) return false;
+      while (p < t.size() && std::isdigit((unsigned char)t[p])) p++;
+    }
     out = Value(std::strtod(t.substr(start, p - start).c_str(), nullptr));
     return true;
   }
