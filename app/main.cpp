@@ -129,7 +129,17 @@ class Scheduler {
       sim_.setEStop(false);
       sim_.reset(conf_.home);
     } else if (type == "teach_add") {
-      teach_.push_back(sim_.state().q);
+      // G1：示教点上限——WS 无鉴权，任何客户端都可反复调用；无上限会成为内存增长路径
+      //      （每点 6×8 B；上限 4096 点 ≈ 196 KB）。超限时明确回错（不静默丢弃）。
+      if (teach_.size() >= kMaxTeachPoints) {
+        json::Value v = json::Value::object();
+        v.set("type", json::Value("error"));
+        v.set("reason", json::Value("teach_full"));
+        v.set("limit", json::Value(double(kMaxTeachPoints)));
+        if (io_) io_->sendToLast(v);
+      } else {
+        teach_.push_back(sim_.state().q);
+      }
     } else if (type == "teach_clear") {
       teach_.clear();
     } else if (type == "teach_play") {
@@ -174,6 +184,9 @@ class Scheduler {
     st.safEnabled = safemon_.enabled();
     io.broadcastState(st);
   }
+
+  // 示教点上限（4096 点 × 6 关节 × 8 B ≈ 196 KB；超限回 error{teach_full}）
+  static constexpr size_t kMaxTeachPoints = 4096;
 
   void setIo(ControlInterface* io) { io_ = io; }
   void setSafetyEnabled(bool on) { safemon_.setEnabled(on); }
@@ -350,7 +363,7 @@ class Scheduler {
 void printUsage() {
   std::printf(
       "用法: arm_sim [--port 8080] [--web web] [--dt 0.002] [--seed 7]\n"
-      "              [--serial /dev/ttyUSB0] [--demo N] [--selftest]\n"
+      "              [--serial /dev/ttyUSB0] [--serial-role master|pendant] [--demo N] [--selftest]\n"
       "              [--allow-origin URL]...   WS Origin 白名单（可重复；缺省放行所有）\n"
       "              [--no-safemon] [--safemon-estop]  独立安全监控层开关（默认启用）\n");
 }
@@ -376,12 +389,36 @@ int selftest() {
 
 }  // namespace
 
+// Master 角色：把上层已派发的指令镜像为真机 CMD_* 帧（真机语义：本端是控制上位机）。
+// Pendant 角色不转发（该角色下对端才是指令源）。
+static void forwardToRobot(arm::SerialDriver& s, const arm::json::Value& c) {
+  if (s.role() != arm::SerialDriver::Role::Master) return;
+  const std::string t = c.get("type").asString();
+  if (t == "joint_target") {
+    std::array<double, 6> q{};
+    auto a = c.get("q");
+    for (int i = 0; i < 6; i++) q[size_t(i)] = a.numAt(size_t(i));
+    s.sendCmdPos(q);
+  } else if (t == "joint_vel") {
+    std::array<double, 6> v{};
+    auto a = c.get("qd");
+    for (int i = 0; i < 6; i++) v[size_t(i)] = a.numAt(size_t(i));
+    s.sendCmdVel(v);
+  } else if (t == "grip") {
+    s.sendCmdGrip(c.get("g").asNumber(0.0));
+  } else if (t == "estop") {
+    s.sendCmdEstop(c.get("on").asBool());
+  }
+  // 其余类型（reset/teach_*/grasp…）无对应下行帧：保持本地语义，不下发
+}
+
 int main(int argc, char** argv) {
   int port = 8080;
   std::string webRoot = "web";
   double dt = 0.002;
   uint64_t seed = 7;
   std::string serialDev;
+  std::string serialRole = "master";   // --serial-role master|pendant（真机语义 / 示教器语义）
   long demoSteps = -1;
   std::vector<std::string> allowOrigins;   // WS Origin 白名单（空 = 放行所有；--allow-origin 可重复）
   bool safemonOff = false;                 // --no-safemon：关闭独立安全监控层（默认启用）
@@ -398,6 +435,7 @@ int main(int argc, char** argv) {
     else if (a == "--dt") dt = std::atof(next("--dt"));
     else if (a == "--seed") seed = uint64_t(std::atoll(next("--seed")));
     else if (a == "--serial") serialDev = next("--serial");
+    else if (a == "--serial-role") serialRole = next("--serial-role");
     else if (a == "--demo") demoSteps = std::atol(next("--demo"));
     else if (a == "--allow-origin") allowOrigins.push_back(next("--allow-origin"));
     else if (a == "--no-safemon") safemonOff = true;
@@ -441,8 +479,26 @@ int main(int argc, char** argv) {
 
   WsServer ws(port, webRoot);
   if (!allowOrigins.empty()) ws.setOriginAllowlist(std::move(allowOrigins));   // 空 = 放行所有
+  // 串口（真机路径）先建立，便于 /api/health 暴露其在线/队列/丢弃计数
+  std::unique_ptr<SerialDriver> serial;
+  if (!serialDev.empty()) {
+    const SerialDriver::Role role = (serialRole == "pendant") ? SerialDriver::Role::Pendant
+                                                              : SerialDriver::Role::Master;
+    serial = std::make_unique<SerialDriver>(serialDev, 115200, role);
+    if (!serial->begin()) {
+      std::fprintf(stderr, "串口 %s 打开失败（纯仿真继续）\n", serialDev.c_str());
+      serial.reset();
+    } else {
+      std::printf("[serial] %s 已连接 role=%s（%s）；待发队列上限 %zu B，丢弃策略=丢最旧+计数\n",
+                  serialDev.c_str(), serialRole.c_str(),
+                  role == SerialDriver::Role::Master ? "真机语义：发 CMD_* / 收 STATE_REP"
+                                                     : "示教器语义：推 STATE_REP / 收 CMD_*",
+                  SerialDriver::kDefaultTxLimit);
+    }
+  }
+
   // /api/health 注入安全层计数（运维可直接 curl 监控，无需连 WS）
-  ws.setHealthExtra([&sched](json::Value& v) {
+  ws.setHealthExtra([&sched, &serial, &serialRole](json::Value& v) {
     const auto& sc = sched.safetyCounters();
     v.set("safety_enabled", json::Value(sched.safetyEnabled()));
     v.set("safety_total", json::Value(double(sc.total())));
@@ -451,18 +507,28 @@ int main(int argc, char** argv) {
     v.set("safety_acc", json::Value(double(sc.accState)));
     v.set("safety_step", json::Value(double(sc.stepJump)));
     v.set("safety_estop", json::Value(double(sc.estopTriggers)));
+    // 串口真机路径可观测性（E 批）：在线状态 / 待发队列 / 丢弃与错误计数
+    v.set("serial_attached", json::Value(serial != nullptr));
+    if (serial) {
+      const auto& ts = serial->txStats();
+      v.set("serial_online", json::Value(serial->online()));
+      v.set("serial_role", json::Value(serialRole));
+      v.set("serial_tx_queued_bytes", json::Value(double(ts.queuedBytes)));
+      v.set("serial_tx_queued_frames", json::Value(double(ts.queuedFrames)));
+      v.set("serial_tx_written", json::Value(double(ts.written)));
+      v.set("serial_tx_dropped_full", json::Value(double(ts.droppedFull)));
+      v.set("serial_tx_dropped_offline", json::Value(double(ts.droppedOffline)));
+      v.set("serial_tx_retries", json::Value(double(ts.retries)));
+      v.set("serial_io_errors", json::Value(double(ts.ioErrors)));
+      v.set("serial_rx_overflow", json::Value(double(ts.rxOverflow)));
+      v.set("serial_state_frames", json::Value(double(serial->remoteState().frames)));
+    }
+    v.set("teach_points", json::Value(double(sched.teach().size())));   // G1：示教点水位
+    v.set("teach_limit", json::Value(double(Scheduler::kMaxTeachPoints)));
   });
   if (!ws.begin()) {
     std::fprintf(stderr, "WS 服务启动失败 (port=%d)\n", port);
     return 1;
-  }
-  std::unique_ptr<SerialDriver> serial;
-  if (!serialDev.empty()) {
-    serial = std::make_unique<SerialDriver>(serialDev);
-    if (!serial->begin()) {
-      std::fprintf(stderr, "串口 %s 打开失败（纯仿真继续）\n", serialDev.c_str());
-      serial.reset();
-    }
   }
   sched.setIo(&ws);
   std::printf("Lyra arm_sim 就绪: http://0.0.0.0:%d/  (ws: /ws, web: %s)\n", port, webRoot.c_str());
@@ -487,20 +553,24 @@ int main(int argc, char** argv) {
         if (serial) serial->emergencyStop();
       }
       sched.command(c);
-      if (serial) serial->broadcastState(StateSnapshot{});  // 状态经主广播统一发
+      if (serial) forwardToRobot(*serial, c);   // Master：指令 → CMD_* 帧（真机语义）
     }
-    if (serial)
-      for (auto& c : serial->pollCommands()) sched.command(c);
+    if (serial) {
+      if (serial->role() == SerialDriver::Role::Pendant) {
+        // 示教器语义：对端是指令源 → 其 CMD_* 进主调度
+        for (auto& c : serial->pollCommands()) sched.command(c);
+      } else {
+        // 真机语义：只解析对端 STATE_REP（经 health 暴露）；不产生 CMD 指令
+        (void)serial->pollCommands();
+      }
+    }
 
     sched.tick(dt);
 
     if (frame % bcastEvery == 0) {
       sched.broadcastTo(ws);
-      if (serial) {
-        StateSnapshot st;
-        // 串口只关心 q/qd/grip，复用广播体
-        sched.broadcastTo(*serial);
-      }
+      // 仅示教器语义才周期下行 STATE_REP；真机语义（Master）不向机器人推状态
+      if (serial && serial->role() == SerialDriver::Role::Pendant) sched.broadcastTo(*serial);
     }
     frame++;
     std::this_thread::sleep_until(next);

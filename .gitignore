@@ -38,3 +38,6 @@ learning/logs/*
 
 # CTorch 本地构建
 # 置顶 CTorch 子目录的构建产物
+# Python 缓存（测试脚本）
+__pycache__/
+*.pyc

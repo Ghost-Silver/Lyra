@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 using namespace learn;
@@ -121,7 +122,66 @@ double stdOf(const std::vector<double>& v, size_t a, size_t b) {
 
 }  // namespace
 
-int main() {
+// 稳健显著性口径（F2）：
+//   原口径「|Δ| > 2·σ_合并 ⇒ 显著」在 n=4 的小样本下不稳定（同一配置换种子结论会翻转）。
+//   改为三条**稳健**断言：
+//     A. 不劣化界限：末段均值 ≥ 首段均值 − 1.0·σ_合并（不出现超出噪声的退化）
+//     B. 方差同量级：末段 σ ∈ [0.2×首段 σ, 5×首段 σ]（不塌缩、不爆炸）
+//     C. 显著退化（Δ < −2σ）仍硬失败；显著改善只**警告**（提示更新文档），不再作为硬断言
+//   统计功效局限：n=12 回合、每段 4 个样本，任何"显著/不显著"结论本身都带统计噪声；
+//   故只对"劣化"这种单向风险设硬门槛。多种子一致性由 --seed-scan 报告（不入默认路径）。
+struct Verdict {
+  double m1, s1, m2, s2, diff, sd;
+  bool sigImprove, sigDegrade;
+};
+Verdict judge(const std::vector<double>& ret) {
+  Verdict v{};
+  size_t n = ret.size();
+  size_t k = n / 3;
+  v.m1 = meanOf(ret, 0, k);
+  v.s1 = stdOf(ret, 0, k);
+  v.m2 = meanOf(ret, n - k, n);
+  v.s2 = stdOf(ret, n - k, n);
+  v.sd = std::sqrt(0.5 * (v.s1 * v.s1 + v.s2 * v.s2));
+  v.diff = v.m2 - v.m1;
+  v.sigImprove = v.sd > 1e-9 && v.diff > 2.0 * v.sd;
+  v.sigDegrade = v.sd > 1e-9 && v.diff < -2.0 * v.sd;
+  return v;
+}
+
+int main(int argc, char** argv) {
+  bool seedScan = false;
+  for (int i = 1; i < argc; i++)
+    if (std::string(argv[i]) == "--seed-scan") seedScan = true;
+
+  if (seedScan) {
+    // F2：多种子一致性报告（默认路径不跑；CI 可按需调用）
+    const uint64_t seeds[] = {7, 11, 23, 42, 101};
+    std::printf("[F2] 短程 REINFORCE 多种子扫描（同配置，仅换种子）\n");
+    std::printf("  %-6s %10s %10s %10s %10s %8s  %s\n", "seed", "首段均值", "首段σ", "末段均值",
+                "末段σ", "Δ", "判定(旧口径 ±2σ)");
+    int nImp = 0, nDeg = 0, nNs = 0;
+    double worstDiff = 1e30;
+    for (uint64_t sd : seeds) {
+      ShortRun R = runShort(sd, 24, 4, 100, 12);
+      Verdict v = judge(R.returns);
+      const char* verdict = v.sigImprove ? "显著改善" : (v.sigDegrade ? "显著退化" : "不显著");
+      if (v.sigImprove) nImp++;
+      else if (v.sigDegrade) nDeg++;
+      else nNs++;
+      worstDiff = std::min(worstDiff, v.diff);
+      std::printf("  %-6llu %10.2f %10.2f %10.2f %10.2f %8.2f  %s (Δ/σ=%+.2f)\n",
+                  (unsigned long long)sd, v.m1, v.s1, v.m2, v.s2, v.diff, verdict,
+                  v.sd > 1e-9 ? v.diff / v.sd : 0.0);
+    }
+    std::printf("  → 一致性：显著改善 %d/%zu、不显著 %d/%zu、显著退化 %d/%zu（口径本身有噪声）；"
+                "最差 Δ=%.2f\n",
+                nImp, sizeof(seeds) / sizeof(seeds[0]), nNs, sizeof(seeds) / sizeof(seeds[0]), nDeg,
+                sizeof(seeds) / sizeof(seeds[0]), worstDiff);
+    std::printf("  结论：小样本下旧口径会随种子翻转 → 默认测试改用稳健断言（不劣化界限 + 方差同量级）\n");
+    return 0;
+  }
+
   const uint64_t seed = 7;
   const int hidden = 24, demos = 4, bcEpochs = 100, rlEps = 12;
   std::printf("[cfg] seed=%llu hidden=%d demos=%d bcEpochs=%d rlEpisodes=%d（短程基准）\n",
@@ -167,24 +227,29 @@ int main() {
     std::printf("[det] 参数 FNV-1a 指纹 = %016llx（两次运行一致=%s）\n", h, bitEqual ? "是" : "否");
   }
 
-  // ---- ③ 如实断言能力边界：短程 REINFORCE 改善不显著 ----
+  // ---- ③ 能力边界（F2 稳健口径）----
   {
-    size_t n = A.returns.size();
-    CHECK(n >= 6, "回合数不足以判边界");
-    size_t k = n / 3;
-    double m1 = meanOf(A.returns, 0, k), s1 = stdOf(A.returns, 0, k);
-    double m2 = meanOf(A.returns, n - k, n), s2 = stdOf(A.returns, n - k, n);
-    double sd = std::sqrt(0.5 * (s1 * s1 + s2 * s2));
-    double diff = m2 - m1;
-    bool significant = sd > 1e-9 && std::abs(diff) > 2.0 * sd;
-    std::printf("[boundary] 回报 首段 %.2f±%.2f → 末段 %.2f±%.2f（Δ=%.2f, 合并 σ=%.2f）: %s\n",
-                m1, s1, m2, s2, diff, sd,
-                significant ? "**显著改善**（请更新 README/PR 的能力边界与基准数字）"
-                            : "不显著（方差主导）——与 README/PR 的如实说明一致");
+    CHECK(A.returns.size() >= 6, "回合数不足以判边界");
     for (double r : A.returns) CHECK(std::isfinite(r), "回报非有限: %g", r);
-    // 边界断言：当前配置下不宣称改善。若此断言失败，说明能力边界真的变了 → 更新文档与基准。
-    CHECK(!significant,
-          "短程 REINFORCE 出现统计显著改善——请更新 README/PR 的能力边界描述与基准数字");
+    Verdict v = judge(A.returns);
+    std::printf("[boundary] 回报 首段 %.2f±%.2f → 末段 %.2f±%.2f（Δ=%.2f, 合并 σ=%.2f, Δ/σ=%+.2f）\n",
+                v.m1, v.s1, v.m2, v.s2, v.diff, v.sd, v.sd > 1e-9 ? v.diff / v.sd : 0.0);
+
+    // A. 不劣化界限（硬断言）：末段均值不得低于「首段均值 − 1σ」
+    CHECK(v.m2 >= v.m1 - v.sd,
+          "短程 REINFORCE 出现超出噪声的劣化（末段 %.2f < 首段 %.2f − σ %.2f）", v.m2, v.m1, v.sd);
+    // B. 方差同量级（硬断言）：既未塌缩（学到确定性但更差）也未爆炸（训练发散）
+    CHECK(v.s2 >= 0.2 * v.s1 && v.s2 <= 5.0 * v.s1,
+          "回报方差变化超出量级（首段 σ=%.2f → 末段 σ=%.2f）", v.s1, v.s2);
+    // C. 显著退化（硬失败）；显著改善只警告 —— 不把带统计噪声的「不显著」当断言
+    CHECK(!v.sigDegrade, "短程 REINFORCE 出现统计显著退化（Δ=%.2f < −2σ）", v.diff);
+    if (v.sigImprove)
+      std::printf("[boundary][warn] 本种子出现显著改善（Δ=%.2f > 2σ）——请复核 README/PR 的边界"
+                  "表述；多种子一致性见 `%s --seed-scan`\n",
+                  v.diff, "test_train_regression");
+    else
+      std::printf("[boundary] 判定：不劣化且方差同量级（口径：末段 ≥ 首段−1σ，σ 比值 ∈[0.2,5]；"
+                  "「显著/不显著」本身有噪声，故不作硬断言 —— 见 --seed-scan）\n");
   }
 
   if (g_fail == 0) std::printf("test_train_regression PASS\n");

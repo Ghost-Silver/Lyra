@@ -37,6 +37,16 @@ class REINFORCETrainer {
 
   ctorch_ext::Adam& optimizer() { return opt_; }
 
+  // 最近一次 update() 的 advantage 白化统计（供测试断言：白化后均值≈0、方差≈1；
+  // 以及 wStd<1e-6 退化分支确实走了 1.0 兜底，而不是除零产生 NaN）
+  struct WhitenStat {
+    size_t n = 0;
+    double rawMean = 0, rawStd = 0;    // 白化前
+    double postMean = 0, postStd = 0;  // 白化后
+    bool stdFloorUsed = false;         // 退化分支：标准差下界兜底
+  };
+  const WhitenStat& lastWhiten() const { return whiten_; }
+
   void addEpisode(Episode ep) {
     // baseline 由 update() 按折扣回报维护（与 advantage 同量纲）
     batch_.push_back(std::move(ep));
@@ -92,8 +102,20 @@ class REINFORCETrainer {
     wMean /= double(wv.size());
     for (float v : wv) wVar += (v - wMean) * (v - wMean);
     double wStd = std::sqrt(wVar / double(wv.size()));
-    if (wStd < 1e-6) wStd = 1.0;
+    whiten_ = WhitenStat{};
+    whiten_.n = wv.size();
+    whiten_.rawMean = wMean;
+    whiten_.rawStd = wStd;
+    if (wStd < 1e-6) { whiten_.stdFloorUsed = true; wStd = 1.0; }
     for (float& v : wv) v = float((v - wMean) / wStd);
+    {
+      double pm = 0, pv = 0;
+      for (float v : wv) pm += v;
+      pm /= double(wv.size());
+      for (float v : wv) pv += (double(v) - pm) * (double(v) - pm);
+      whiten_.postMean = pm;
+      whiten_.postStd = std::sqrt(pv / double(wv.size()));
+    }
     std::printf("[w-stat] N=%zu raw[%.2f..%.2f] mean=%.2f std=%.2f\n", wv.size(), wMin, wMax, wMean, wStd);
 
     Tensor obs = fromVector(obsv);
@@ -155,6 +177,7 @@ class REINFORCETrainer {
   MLPPolicy& policy_;
   ctorch_ext::Adam opt_;
   double gamma_, entropy_, bDecay_, maxGrad_;
+  WhitenStat whiten_;
   double totalR_ = 0;
   bool hasBaseline_ = false;
   std::vector<Episode> batch_;

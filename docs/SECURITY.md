@@ -52,6 +52,9 @@
 | 静态文件路径校验 | 强制 | `realpath` 前缀 + `O_NOFOLLOW`：`../` 与 symlink 逃逸 → 403 |
 | 静态文件体积上限 | 192 KiB（超出 413）+ 8 MiB 内存缓存 | 避免大文件读取阻塞实时控制循环（2 MiB 直读 ≈ 6.4 ms = 3 个控制周期） |
 | Origin 白名单 | **可选，默认放行所有** | `--allow-origin URL`（可重复；`*` 为通配条目）；无 Origin 的非浏览器客户端始终放行 |
+| 示教点上限 | **4096 点**（≈196 KB） | 未鉴权 WS 可反复 `teach_add`；超限回 `error{teach_full}` 并计数（`/api/health.teach_points` 观测水位） |
+| 串口待发队列上限 | **16 KiB**（丢最旧 + 计数） | 真机路径：部分写续传 / `EAGAIN` 重试 / 硬错误离线；离线后不再入队（防无界增长），计数见 `/api/health.serial_*` |
+| 串口读缓冲上限 | **4 KiB** | 半截帧/垃圾流清空并计数（`serial_rx_overflow`） |
 
 ### 4.2 实时安全层（`lib/arm/control/safety_monitor.hpp`，独立于规划/IK）
 
