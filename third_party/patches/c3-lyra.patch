@@ -1,0 +1,35 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6b5085d..a902a89 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -118,12 +118,14 @@ set(C3-Core-Sources
+         ${CMAKE_CURRENT_SOURCE_DIR}/src/C3/RollingHash.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/src/C3/RegionFusionRegistry.cpp)
+ 
++# [Lyra vendored patch] MLIRKernelGen.cpp / JITCache.cpp 无条件包含 MLIR/LLVM 头，
++# CT_ENABLE_MLIR=OFF 时无法编译；移入 if(CT_ENABLE_MLIR) 块（见 third_party/PATCHES.md）
+ set(C3-MLIR-Sources
+-        ${CMAKE_CURRENT_SOURCE_DIR}/src/C3/MLIRKernelGen.cpp
+-        ${CMAKE_CURRENT_SOURCE_DIR}/src/C3/JITCache.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/src/C3/MLIRToLLVMIR.cpp)
+ if(CT_ENABLE_MLIR)
+     list(APPEND C3-MLIR-Sources
++            ${CMAKE_CURRENT_SOURCE_DIR}/src/C3/MLIRKernelGen.cpp
++            ${CMAKE_CURRENT_SOURCE_DIR}/src/C3/JITCache.cpp
+             ${CMAKE_CURRENT_SOURCE_DIR}/src/C3/C3Dialect.cpp
+             ${CMAKE_CURRENT_SOURCE_DIR}/src/C3/C3DialectLowering.cpp
+             ${CMAKE_CURRENT_SOURCE_DIR}/src/C3/LinalgElementwiseGen.cpp
+diff --git a/src/C3/C3Engine.cpp b/src/C3/C3Engine.cpp
+index 896494a..f867f5c 100644
+--- a/src/C3/C3Engine.cpp
++++ b/src/C3/C3Engine.cpp
+@@ -11,6 +11,9 @@
+ #include "C3/C3Error.h"
+ #include "C3/C3Engine.h"
+ #include "C3/Graph.h"
++// [Lyra vendored patch] GeneratedKernel.h 原仅经 MLIRKernelGen.h 间接引入，
++// CT_ENABLE_MLIR=OFF 时缺失；这里直接包含以修复非 MLIR 构建（见 third_party/PATCHES.md）
++#include "C3/GeneratedKernel.h"
+ #include "C3/C3HotPathManager.h"
+ #include "C3/PGOManager.h"
+ #include "C3/AutoTuner.h"

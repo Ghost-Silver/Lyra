@@ -1,0 +1,192 @@
+diff --git a/.gitmodules b/.gitmodules
+index 6aca8c6..a02f769 100644
+--- a/.gitmodules
++++ b/.gitmodules
+@@ -1,4 +1,4 @@
+ [submodule "c3"]
+ 	path = c3
+-	url = git@github.com:ShengFlow/C3.git
++	url = https://github.com/ShengFlow/C3.git
+ 	branch = main
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index cb5b1cb..6ad7a99 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -187,11 +187,13 @@ set(CT-C3-Core
+ #     L106 这里只 list APPEND MetalDevice.mm + MPSAllocator.mm (单独 set)
+ 
+ # MLIR kernel 生成器：仅在 CT_ENABLE_MLIR 时编译（归入 C3Core 库）
++# [Lyra vendored patch] MLIRKernelGen.cpp / JITCache.cpp 无条件包含 MLIR/LLVM 头，
++# CT_ENABLE_MLIR=OFF 时无法编译；移入 if 块（见 third_party/PATCHES.md）
+ set(CT-C3-MLIR-Core
+-        c3/src/C3/MLIRKernelGen.cpp
+-        c3/src/C3/JITCache.cpp
+         c3/src/C3/MLIRToLLVMIR.cpp)  # [Dev] v0.5 DCU 接入: MLIR → LLVM IR helper
+ if(CT_ENABLE_MLIR)
++    list(APPEND CT-C3-MLIR-Core c3/src/C3/MLIRKernelGen.cpp)
++    list(APPEND CT-C3-MLIR-Core c3/src/C3/JITCache.cpp)
+     list(APPEND CT-C3-MLIR-Core c3/src/C3/C3Dialect.cpp)
+     list(APPEND CT-C3-MLIR-Core c3/src/C3/C3DialectLowering.cpp)
+     # [2026-08-15] linalg.generic 声明式逐元素 kernel（JIT 2.0 路线 A 移植，STATUS_CONTEXT 4.9/4.7-2）
+@@ -509,10 +511,15 @@ set(CT-Distributed
+         src/Distributed/CheckpointManager.cpp
+         src/Distributed/Transport.cpp
+         src/Distributed/CPUBackend.cpp
+-        src/Distributed/MPSBackend.mm
++        # [Lyra vendored patch] MPSBackend.mm 为 macOS/Objective-C++ 专属，移至下方 if(APPLE)
++        # （见 third_party/PATCHES.md）
+         src/Distributed/DistributedTrainer.cpp
+ )
+ 
++if(APPLE)
++    list(APPEND CT-Distributed src/Distributed/MPSBackend.mm)
++endif()
++
+ set(ctQALS
+         include/ctQALS/ctQALS.h
+         include/ctQALS/Random.h
+diff --git a/c3 b/c3
+--- a/c3
++++ b/c3
+@@ -1 +1 @@
+-Subproject commit e96f6c577ae0ec7bd09b6c7dd9dd0adaad2d7a71
++Subproject commit e96f6c577ae0ec7bd09b6c7dd9dd0adaad2d7a71-dirty
+diff --git a/include/ops/SiLU.h b/include/ops/SiLU.h
+index a41a8e6..b054455 100644
+--- a/include/ops/SiLU.h
++++ b/include/ops/SiLU.h
+@@ -28,6 +28,8 @@
+ #define CTORCH_OPS_SILU_H
+ 
+ #include "Tensor.h"
++// [Lyra vendored patch] 补 <cmath>（std::exp 依赖，见 third_party/PATCHES.md）
++#include <cmath>
+ 
+ namespace ct::ops {
+ 
+diff --git a/src/AutoGrad/Nodes/GradAccumulator.cpp b/src/AutoGrad/Nodes/GradAccumulator.cpp
+index 3ef1730..5c2d21d 100644
+--- a/src/AutoGrad/Nodes/GradAccumulator.cpp
++++ b/src/AutoGrad/Nodes/GradAccumulator.cpp
+@@ -5,6 +5,8 @@
+  *@date 2026/4/3
+  **/
+ 
++// [Lyra vendored patch] 补 x86 SIMD intrinsics 头（见 third_party/PATCHES.md）
++#include <immintrin.h>
+ #include "../include/AutoGrad/Nodes/GradAccumulator.h"
+ #include "../include/Tensor.h"
+ #include "../../../src/kernels/kernels.h"
+@@ -17,10 +19,17 @@ GradAccumulator::GradAccumulator(std::weak_ptr<Tensor> tensor) : _tensor(std::mo
+     }
+ }
+ 
+-std::vector<GradPack> GradAccumulator::backward(const std::vector<Tensor>& downStreamGrads) {
+-    if (downStreamGrads.empty()) {
++std::vector<GradPack> GradAccumulator::backward(const std::vector<Tensor>& downStreamGradsIn) {
++    if (downStreamGradsIn.empty()) {
+         return {};
+     }
++    // [Lyra vendored patch] 非连续入射梯度（如转置视图）先物化为连续布局：
++    // 本函数的 SIMD/原地累加按线性下标读写，直接消费跨步视图会梯度错位（见 third_party/PATCHES.md）
++    std::vector<Tensor> downStreamGrads;
++    downStreamGrads.reserve(downStreamGradsIn.size());
++    for (const auto& g : downStreamGradsIn) {
++        downStreamGrads.push_back(g.numel() > 0 ? g.contiguous() : g);
++    }
+ 
+     if (auto tensor = _tensor.lock()) {
+         if (tensor->device() == DeviceType::kMPS) {
+diff --git a/src/AutoGrad/Nodes/TransposeNode.cpp b/src/AutoGrad/Nodes/TransposeNode.cpp
+index 8106ad4..468ff5e 100644
+--- a/src/AutoGrad/Nodes/TransposeNode.cpp
++++ b/src/AutoGrad/Nodes/TransposeNode.cpp
+@@ -23,7 +23,10 @@ std::vector<GradPack> TransposeNode::backward(const std::vector<Tensor>& downStr
+     //
+     // 这里必须用 transposeNoGrad（纯元数据视图，不注册节点）——若在反向过程中
+     // 走 transpose() 会再次建图，导致每次 backward 都往图上接一段，图逐轮膨胀。
+-    Tensor grad = downStreamGrads[0].transposeNoGrad(_dim0, _dim1);
++    // [Lyra vendored patch] 转置梯度必须物化为连续张量：transposeNoGrad 仅是元数据
++    // 视图（内存序不变），下游 GradAccumulator/加法核按线性下标累加会把 (m,n) 布局的
++    // 梯度原样平铺进 (n,m) 叶子缓冲区，梯度整体错位（见 third_party/PATCHES.md）
++    Tensor grad = downStreamGrads[0].transposeNoGrad(_dim0, _dim1).contiguous();
+ 
+     ret.push_back(GradPack{
+         _upStreamNodes[0],
+diff --git a/src/CtorchScheduler.cpp b/src/CtorchScheduler.cpp
+index 836995d..71a3abd 100644
+--- a/src/CtorchScheduler.cpp
++++ b/src/CtorchScheduler.cpp
+@@ -5,6 +5,8 @@
+  * @date 2026/04/04
+  */
+ 
++// [Lyra vendored patch] 补 x86 SIMD intrinsics 头（见 third_party/PATCHES.md）
++#include <immintrin.h>
+ #include "./../include/CtorchScheduler.h"
+ #include "./../include/AutoGrad.h"
+ #include "./../include/DeviceAllocator.h"
+diff --git a/src/kernels/CPU-SIMD/CrossEntropy_SIMD_kernel.cpp b/src/kernels/CPU-SIMD/CrossEntropy_SIMD_kernel.cpp
+index 041342c..6be8da8 100644
+--- a/src/kernels/CPU-SIMD/CrossEntropy_SIMD_kernel.cpp
++++ b/src/kernels/CPU-SIMD/CrossEntropy_SIMD_kernel.cpp
+@@ -14,6 +14,8 @@
+  * 数值稳定性：max-subtraction trick。
+  */
+ 
++// [Lyra vendored patch] 补 x86 SIMD intrinsics 头（见 third_party/PATCHES.md）
++#include <immintrin.h>
+ #include "../kernels.h"
+ #include "../../../include/CtorchError.h"
+ #include "../../../include/Tensor.h"
+diff --git a/src/kernels/CPU-SIMD/SIMDMath.cpp b/src/kernels/CPU-SIMD/SIMDMath.cpp
+index 8442561..7f0aa56 100644
+--- a/src/kernels/CPU-SIMD/SIMDMath.cpp
++++ b/src/kernels/CPU-SIMD/SIMDMath.cpp
+@@ -21,6 +21,8 @@
+  * @date 2026/08/03
+  */
+ 
++// [Lyra vendored patch] 补 x86 SIMD intrinsics 头（见 third_party/PATCHES.md）
++#include <immintrin.h>
+ #include "kernels/SIMDMath.h"
+ 
+ #include <cmath>
+diff --git a/src/kernels/CPU-SIMD/SIMDWrapper.cpp b/src/kernels/CPU-SIMD/SIMDWrapper.cpp
+index 96a9623..cd0a195 100644
+--- a/src/kernels/CPU-SIMD/SIMDWrapper.cpp
++++ b/src/kernels/CPU-SIMD/SIMDWrapper.cpp
+@@ -11,6 +11,8 @@
+  * @see SIMDWrapper.h
+  */
+ 
++// [Lyra vendored patch] 补 x86 SIMD intrinsics 头（见 third_party/PATCHES.md）
++#include <immintrin.h>
+ #include "kernels/SIMDWrapper.h"
+ #include "kernels/SIMDConfig.h"
+ #include "kernels/SIMDMath.h"
+diff --git a/src/kernels/CPU-SIMD/Softmax_SIMD_kernel.cpp b/src/kernels/CPU-SIMD/Softmax_SIMD_kernel.cpp
+index 9623ee5..1987f2e 100644
+--- a/src/kernels/CPU-SIMD/Softmax_SIMD_kernel.cpp
++++ b/src/kernels/CPU-SIMD/Softmax_SIMD_kernel.cpp
+@@ -11,6 +11,8 @@
+  * 数值稳定性：减去 axis 上的最大值，避免 exp 溢出。
+  */
+ 
++// [Lyra vendored patch] 补 x86 SIMD intrinsics 头（见 third_party/PATCHES.md）
++#include <immintrin.h>
+ #include "../kernels.h"
+ #include "../../../include/CtorchError.h"
+ #include "../../../include/Tensor.h"
+diff --git a/src/kernels/MPS/MPS_kernel_stubs.cpp b/src/kernels/MPS/MPS_kernel_stubs.cpp
+index 6b68d79..d2aa060 100644
+--- a/src/kernels/MPS/MPS_kernel_stubs.cpp
++++ b/src/kernels/MPS/MPS_kernel_stubs.cpp
+@@ -25,5 +25,6 @@ STUB_INPLACE(Sin) STUB_INPLACE(Cos) STUB_INPLACE(GELU) STUB_INPLACE(LReLU)
+ STUB_INPLACE(Log) STUB_INPLACE(Exp) STUB_INPLACE(Abs)
+ 
+ // Special signatures
+-extern "C" void Softmax_MPS_kernel(const Tensor& a, int dim) {}
++// [Lyra vendored patch] Softmax 签名对齐 kernels.h（Tensor 返回值 C++ 版本，见 third_party/PATCHES.md）
++Tensor Softmax_MPS_kernel(const Tensor& a, int dim) { (void)dim; return a; }
+ extern "C" void Zero_MPS_kernel(const Tensor& a) {}

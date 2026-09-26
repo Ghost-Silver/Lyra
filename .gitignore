@@ -33,6 +33,8 @@ learning/logs/*
 *.ckpt
 *.pt
 *.bin
+*.csv
+!docs/*.csv
 
 # CTorch 本地构建
 # 置顶 CTorch 子目录的构建产物
