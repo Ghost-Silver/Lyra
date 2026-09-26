@@ -1,11 +1,12 @@
 # 揽星 · Lyra — 桌面 6 轴机械臂
 
-**运动学 / 规划 / 轨迹 / 仿真 / 控制 · Web 实时示教 · CTorch 学习层（REINFORCE 第一刀）**
+**运动学 / 规划 / 轨迹 / 仿真 / 控制 · Web 实时示教 · 串口真机路径 · CTorch 学习层**
 
 Lyra 是一个面向桌面 6 轴机械臂的完整软件栈：确定性内核（DH 正逆运动学、数值/解析 IK、
 SCurve 轨迹、纯 C++ 物理仿真）+ WebSocket 实时控制与 Three.js 数字孪生示教台 +
 基于 [CTorch](https://github.com/ShengFlow/CTorch) 的模仿学习/强化学习训练闭环 +
-真机串口（serial）通信接口预留。构建零第三方依赖（CTorch 为可选的学习层依赖）。
+真机串口（serial）通信路径（含非阻塞有界队列、PTY 从机闭环验证）。构建零第三方依赖
+（CTorch 为可选的学习层依赖）。
 
 ```
 ┌────────────────┐   WebSocket/JSON    ┌──────────────────────────┐
@@ -20,6 +21,24 @@ SCurve 轨迹、纯 C++ 物理仿真）+ WebSocket 实时控制与 Three.js 数�
 ```
 
 ---
+
+## 当前状态
+
+| 能力 | 状态 |
+| --- | --- |
+| 运动学 / 规划 / 轨迹 / 仿真 | 完整，数学经独立数值验证（解析 IK 300/300、几何雅可比 vs 数值微分 1e-9） |
+| Web 示教台（孪生 / 拖拽 / 示教回放） | 可用 |
+| 安全层（限位硬 clamp / 速度·加速度审计 / 急停锁存） | 已实现并有回归 |
+| 串口真机路径 | 代码路径完整（有界队列 / 部分写续传 / EAGAIN 重试 / 硬错误离线），经 PTY 从机闭环验证；**未接真实硬件** |
+| CTorch 学习层 | 机制正确（梯度 vs 有限差分吻合）；**短程 REINFORCE 改善不显著**（方差主导，见第 4 节） |
+| 认证 / TLS / 限速 / 审计 | **未实现**，见 `docs/SECURITY.md` |
+
+**定位**：研究原型 / 技术验证平台。仿真是可信的，真机路径的**逻辑**经闭环验证，
+但电气层、时序、下位机固件行为均未验证。
+
+**安全边界**：默认无认证，面向实验室局域网。不可直接暴露公网（无认证、无 TLS、
+Origin 默认放行、无速率限制）。真机接入前必须补独立的硬件急停回路与看门狗——
+本服务只可作为上层指令源，**不得作为唯一安全链路**。
 
 ## 快速开始
 
@@ -65,8 +84,8 @@ cmake --build build-learn -j
 ### 测试
 
 ```bash
-bash tests/run_tests.sh              # Layer 0（6 项，纯 C++ 无依赖）
-WITH_LEARN=1 bash tests/run_tests.sh # + 学习层 3 项（构建 CTorch）+ Runtime 探针
+bash tests/run_tests.sh              # Layer 0（8 项，纯 C++ 无依赖）
+WITH_LEARN=1 bash tests/run_tests.sh # + 学习层 4 项（构建 CTorch）+ Runtime 探针
 ```
 
 `run_tests.sh` 如实分层汇总：**Layer0**（8 项，含 `serial_loopback` PTY 闭环与 `test_longrun`
@@ -119,7 +138,8 @@ p5=0.0054 / 中位 0.0700 / p95=0.1941；行归一 Lchar=0.5 m）：旧阈值 0.
 | `control_interface.hpp` | `ArmController` 接口：`enqueue(指令)`→`poll()`→`StateSnapshot`；50 Hz 控制节拍，`StateSnapshot` 含 `sigmaMin`/`sigIdx`（η）/`manip` |
 | `json.hpp` | 自含 JSON 解析/序列化（UTF-8、转义、\uXXXX、**严格 JSON 数字语法**、**嵌套深度上限 200 层**、越界安全取值 API） |
 | `ws_server.hpp` | 自含 RFC6455 服务端（握手 SHA1+Base64、帧编解码、分片、ping/pong、close）。**安全硬化**：客户端帧强制掩码、控制帧 ≤125 禁分片、孤立 Continuation 拒收、握手三件套校验（Connection/Version/Key）、单帧/消息/缓冲/连接数/发送队列全限额、slowloris 超时回收、**发送严格非阻塞**（慢客户端只被丢弃，不拖死 50 Hz 回路：持续不读取的客户端实测在 **132.5 s** 时因发送缓冲耗尽被丢弃）、静态文件 realpath 前缀校验 + `O_NOFOLLOW`（symlink 逃逸拒绝）、Origin 白名单可选 |
-| `serial_driver.hpp` | **硬件接口预留**：`SerialDriver` 帧协议 `[0xAA][0x55][type:u8][len:u8][payload][crc16:u16]`（**无序号字段**；CRC16-CCITT poly 0x1021 / init 0xFFFF，覆盖 type..payload），`BytesSerial` 可注入假串口（测试回环）；真机路径（termios 打开 `/dev/tty*`）已留桩 |
+| `serial_driver.hpp` | **串口真机路径**：帧协议 `[0xAA][0x55][type:u8][len:u8][payload][crc16:u16]`（**无序号字段**；CRC16-CCITT poly 0x1021 / init 0xFFFF，覆盖 type..payload）。`ByteIo` 抽象（真机 = `FdByteIo` 包 termios fd；测试 = 假串口 / PTY 从机）；**非阻塞有界待发队列**（部分写续传 / EAGAIN 重试 / 硬错误离线 / 队列满丢最旧且计数 / 已部分发送的帧绝不覆盖或丢弃）；角色 `master`（发 `CMD_*` 收 `STATE_REP`）或 `pendant`；统计经 `txStats()` 与 `/api/health.serial_*` 观测 |
+| `safety_monitor.hpp` | **独立安全监控层**（不依赖规划/IK）：下发前位置硬 clamp + 计数、速度/加速度审计、单拍位移跃变回滚+清速；`--no-safemon` 关闭、`--safemon-estop` 越限急停；计数见 `/api/health` 的 `safety_*` |
 
 **协议**（浏览器 ↔ 服务端，JSON 文本帧）：
 
@@ -185,7 +205,8 @@ p5=0.0054 / 中位 0.0700 / p95=0.1941；行归一 Lchar=0.5 m）：旧阈值 0.
 **CTorch 集成**：vendored 于 `third_party/CTorch`（v0.2.10，MIT），固定
 `CT_ENABLE_MLIR=OFF`（免 LLVM）与 `CT_ENABLE_LTO=OFF`，C3 图融合/JIT 管线在无 MLIR
 后端时编译期关闭（eager+autograd 数值等价）。**七类最小 vendored 补丁**（`ctorch-lyra.patch`
-12 文件 + `c3-lyra.patch` 2 文件；含一处**转置梯度错位的关键正确性修复**）全部记录于
+12 文件 + `c3-lyra.patch` 2 文件；含一处**转置梯度错位的关键正确性修复**，回归见
+`tests/test_ctorch_transpose_grad.cpp`：回退补丁即 FAIL、恢复即 PASS）全部记录于
 `third_party/PATCHES.md`——更新依赖前必读。
 
 ## 5. 修复工单（相对第一版工单，逐条完成）
@@ -204,7 +225,7 @@ p5=0.0054 / 中位 0.0700 / p95=0.1941；行归一 Lchar=0.5 m）：旧阈值 0.
 10. ~~README 与 CMake 不一致~~ —— 本文件即以当前 CMake 为准（含 `ARM_ENABLE_CTORCH`/
     `CTORCH_ROOT`）。
 
-## 6. 硬件接口预留
+## 6. 串口真机路径
 
 `serial_driver.hpp` 帧协议 `[0xAA][0x55][type][len][payload][crc16]`（无序号字段，CRC16-CCITT）。
 真机接入的**代码路径已是生产级**：termios 打开 `/dev/tty*`（raw/8N1/无流控）→ `ByteIo` 抽象 →
@@ -224,12 +245,13 @@ p5=0.0054 / 中位 0.0700 / p95=0.1941；行归一 Lchar=0.5 m）：旧阈值 0.
 ```
 app/main.cpp        arm_sim 服务主循环（HTTP+WS 同端口、Scheduler、指令派发、--demo/--selftest）
 lib/arm/            运动学/轨迹/规划/仿真/robot_conf（纯 C++ 头）
-lib/arm/control/    接口/JSON/WS/serial
+lib/arm/control/    接口/JSON/WS/serial/安全监控层
 web/                静态前端（index.html/style.css/app.js）
-tests/              单元测试 + run_tests.sh
+tests/              单元测试 + run_tests.sh + PTY/WS/长时探针
 ctorch_ext/         CTorch 扩展（Linear、Adam）
 learning/           策略/REINFORCE/trainer_main（arm_train）
 third_party/CTorch/ vendored CTorch（见 third_party/PATCHES.md）
+docs/               SECURITY.md（威胁模型/防护清单）、claims-audit.md（声称-实现对照）
 cmake/              GCC 12 __bf16 兼容垫片
 ```
 
