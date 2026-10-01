@@ -449,6 +449,7 @@ int main(int argc, char** argv) {
   std::string serialRole = "master";   // --serial-role master|pendant（真机语义 / 示教器语义）
   long demoSteps = -1;
   std::vector<std::string> allowOrigins;   // WS Origin 白名单（空 = 放行所有；--allow-origin 可重复）
+  std::string authToken;                   // HTTP/WS 认证 token
   bool safemonOff = false;                 // --no-safemon：关闭独立安全监控层（默认启用）
   bool safemonEstop = false;               // --safemon-estop：越限即急停锁存
 
@@ -465,6 +466,7 @@ int main(int argc, char** argv) {
     else if (a == "--serial") serialDev = next("--serial");
     else if (a == "--serial-role") serialRole = next("--serial-role");
     else if (a == "--demo") demoSteps = std::atol(next("--demo"));
+    else if (a == "--token") authToken = next("--token");
     else if (a == "--allow-origin") allowOrigins.push_back(next("--allow-origin"));
     else if (a == "--no-safemon") safemonOff = true;
     else if (a == "--safemon-estop") safemonEstop = true;
@@ -507,6 +509,7 @@ int main(int argc, char** argv) {
 
   WsServer ws(port, webRoot);
   if (!allowOrigins.empty()) ws.setOriginAllowlist(std::move(allowOrigins));   // 空 = 放行所有
+  if (!authToken.empty()) ws.setAuthToken(authToken);                          // 设置 HTTP/WS 认证 token
   // 串口（真机路径）先建立，便于 /api/health 暴露其在线/队列/丢弃计数
   std::unique_ptr<SerialDriver> serial;
   if (!serialDev.empty()) {

@@ -205,6 +205,8 @@ class WsServer : public ControlInterface {
 
   // P1-7：Origin 白名单（空 = 放行所有；设置后须精确匹配，"*" 条目通配）
   void setOriginAllowlist(std::vector<std::string> allow) { allowedOrigins_ = std::move(allow); }
+  // 认证 Token 设置（非空时将对 HTTP 和 WS 握手拦截，检查 Authorization 或 ?token=）
+  void setAuthToken(std::string token) { authToken_ = std::move(token); }
   // 健康检查扩展钩子：宿主可注入额外字段（如安全层计数），保持 ws_server 与业务解耦
   void setHealthExtra(std::function<void(json::Value&)> fn) { healthExtra_ = std::move(fn); }
 
@@ -418,6 +420,43 @@ class WsServer : public ControlInterface {
     c.buf.clear();
 
     if (method != "GET") { respond(c, "405 Method Not Allowed", "text/plain", "GET only"); c.alive = false; return; }
+
+    // P1：认证 Token 校验
+    if (!authToken_.empty()) {
+      bool authOk = false;
+      // 1. 检查 Authorization: Bearer <token>
+      auto auth = hdr.find("authorization");
+      if (auth != hdr.end()) {
+        std::string v = auth->second;
+        if (v.size() > 7 && v.substr(0, 7) == "Bearer ") {
+          if (v.substr(7) == authToken_) authOk = true;
+        }
+      }
+      // 2. 检查 Query Param: ?token=<token>
+      if (!authOk) {
+        size_t q = path.find("?token=");
+        if (q != std::string::npos) {
+          std::string tokenInUrl = path.substr(q + 7);
+          size_t amp = tokenInUrl.find('&');
+          if (amp != std::string::npos) tokenInUrl = tokenInUrl.substr(0, amp);
+          if (tokenInUrl == authToken_) {
+            authOk = true;
+          }
+          // strip token from path for subsequent serving
+          path = path.substr(0, q);
+        }
+      }
+
+      if (!authOk) {
+        respond(c, "401 Unauthorized", "text/plain", "unauthorized");
+        c.alive = false;
+        return;
+      }
+    }
+
+    // 去除 path 上的查询参数 (如果存在其他参数)
+    size_t qmark = path.find('?');
+    if (qmark != std::string::npos) path = path.substr(0, qmark);
 
     // WS 升级（握手三件套校验：Connection: Upgrade / Version: 13 / Key 合法）
     auto up = hdr.find("upgrade");
@@ -635,6 +674,7 @@ class WsServer : public ControlInterface {
   std::string webRoot_;
   std::string rootReal_;
   std::vector<std::string> allowedOrigins_;
+  std::string authToken_;
   int listenFd_ = -1;
   std::vector<Client> clients_;
   std::vector<json::Value> inbox_;
