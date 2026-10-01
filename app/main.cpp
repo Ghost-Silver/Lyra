@@ -97,6 +97,34 @@ class Scheduler {
       q = gate_.clampQ(q);
       double speed = c.get("speed").isNumber() ? c.get("speed").asNumber(0.3) : 0.3;
       planPtp(sim_.state().q, q, speed);
+    } else if (type == "ee_line") {
+      Mat4 T = readPose(c);
+      double speed = c.get("speed").isNumber() ? c.get("speed").asNumber(0.12) : 0.12;
+      Mat4 cur = forwardKinematicsT0_6(conf_.arm, sim_.state().q);
+      auto t = cartesianLineTraj(conf_.arm, cur, T, sim_.state().q, sim_.dt(), speed);
+      beginTraj(t, Mode::Cartesian);
+    } else if (type == "ee_circle") {
+      Vec3 center{c.get("center").numAt(0), c.get("center").numAt(1), c.get("center").numAt(2)};
+      Vec3 normal{c.get("normal").numAt(0), c.get("normal").numAt(1), c.get("normal").numAt(2)};
+      double radius = c.get("radius").asNumber(0.1);
+      double startAngle = c.get("start_angle").asNumber(0.0);
+      double sweep = c.get("sweep").asNumber(M_PI);
+      double speed = c.get("speed").isNumber() ? c.get("speed").asNumber(0.12) : 0.12;
+      Mat4 cur = forwardKinematicsT0_6(conf_.arm, sim_.state().q);
+      auto t = cartesianCircleTraj(conf_.arm, center, normal, radius, startAngle, sweep, cur, sim_.state().q, sim_.dt(), speed);
+      beginTraj(t, Mode::Cartesian);
+    } else if (type == "ee_path") {
+      auto poses = c.get("poses");
+      if (poses.isArray()) {
+        std::vector<Mat4> waypoints;
+        for (size_t i = 0; i < poses.size(); i++) {
+          waypoints.push_back(readPose(poses[i]));
+        }
+        double blendRadius = c.get("blend_radius").asNumber(0.02);
+        double speed = c.get("speed").isNumber() ? c.get("speed").asNumber(0.12) : 0.12;
+        auto t = cartesianBlendPathTraj(conf_.arm, waypoints, sim_.state().q, blendRadius, sim_.dt(), speed);
+        beginTraj(t, Mode::Cartesian);
+      }
     } else if (type == "ee_target") {
       Mat4 T = readPose(c);
       std::array<double, 6> q;
