@@ -422,7 +422,9 @@ class WsServer : public ControlInterface {
     if (method != "GET") { respond(c, "405 Method Not Allowed", "text/plain", "GET only"); c.alive = false; return; }
 
     // P1：认证 Token 校验
-    if (!authToken_.empty()) {
+    // 只拦截 WS 升级和 /api/ 接口；静态文件放行，以便 UI 加载
+    bool isApiOrWs = (path.find("/api") == 0) || (path.find("/ws") == 0) || (hdr.count("upgrade") > 0);
+    if (!authToken_.empty() && isApiOrWs) {
       bool authOk = false;
       // 1. 检查 Authorization: Bearer <token>
       auto auth = hdr.find("authorization");

@@ -54,7 +54,12 @@ let lastState = null;
 let reconnectTimer = null;
 
 function wsConnect() {
-  const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+  let url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+  const urlParams = new URLSearchParams(window.location.search);
+  const token = urlParams.get('token');
+  if (token) {
+    url += '?token=' + encodeURIComponent(token);
+  }
   ws = new WebSocket(url);
   ws.onopen = () => {
     wsAlive = true;
@@ -229,6 +234,52 @@ $('go-ee').onclick = () => send({
   rpy: [+$('pr').value, +$('pp').value, +$('pw').value],
   speed: speed(),
 });
+$('go-ee-line').onclick = () => send({
+  type: 'ee_line',
+  pos: [+$('px').value, +$('py').value, +$('pz').value],
+  rpy: [+$('pr').value, +$('pp').value, +$('pw').value],
+  speed: speed() * 0.3, // 笛卡尔线速度
+});
+$('demo-circle').onclick = () => {
+  const cx = +$('px').value;
+  const cy = +$('py').value;
+  const cz = +$('pz').value;
+  // planning.hpp 中 normal=[1,0,0] 时，ref=[0,1,0], u=[0,0,-1], v=[0,1,0]
+  // 若圆心在 [cx, cy - 0.05, cz]，
+  // P_start = center + u * cos(a) * r + v * sin(a) * r
+  // 欲使 P_start = [cx, cy, cz]
+  // 即 center + [0, 0.05, 0] = [cx, cy, cz]
+  // [0, 0.05, 0] = u * cos(a) * 0.05 + v * sin(a) * 0.05
+  // = [0, 0, -0.05*cos(a)] + [0, 0.05*sin(a), 0]
+  // 所以 -0.05*cos(a) = 0 => cos(a) = 0
+  // 0.05*sin(a) = 0.05 => sin(a) = 1 => a = PI / 2
+  send({
+    type: 'ee_circle',
+    center: [cx, cy - 0.05, cz],
+    normal: [1, 0, 0],
+    radius: 0.05,
+    start_angle: Math.PI / 2,
+    sweep: Math.PI * 2,
+    speed: speed() * 0.3,
+  });
+};
+$('demo-path').onclick = () => {
+  const p = [+$('px').value, +$('py').value, +$('pz').value];
+  const rpy = [+$('pr').value, +$('pp').value, +$('pw').value];
+  send({
+    type: 'ee_path',
+    poses: [
+      { pos: p, rpy: rpy },
+      { pos: [p[0], p[1] + 0.1, p[2]], rpy: rpy },
+      { pos: [p[0], p[1] + 0.1, p[2] - 0.1], rpy: rpy },
+      { pos: [p[0], p[1], p[2] - 0.1], rpy: rpy },
+      { pos: p, rpy: rpy }
+    ],
+    blend_radius: 0.03,
+    speed: speed() * 0.3,
+  });
+};
+
 $('grip').addEventListener('input', () => send({ type: 'grip', g: +$('grip').value }));
 $('teach-add').onclick = () => send({ type: 'teach_add' });
 $('teach-clear').onclick = () => { send({ type: 'teach_clear' }); $('demo-out').value = ''; };

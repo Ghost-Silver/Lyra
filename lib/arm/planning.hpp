@@ -158,11 +158,7 @@ inline JointTrajectory cartesianLineTraj(const ArmModel& arm,
     Vec3 pos = pa + (pb - pa) * lambda;
     Mat4 Tw = Mat4::translation(pos) * rotationSlerp(T0, Tf, lambda);
     std::array<double, 6> qnew;
-    if (!inverseKinematics(arm, Tw, q, qnew)) {
-        // debug
-        // std::cerr << "IK Failed at i=" << i << " s=" << s << "\n";
-        return {};
-    }
+    if (!inverseKinematics(arm, Tw, q, qnew)) return {};
     if (i > 0) {
       // ② 关节限速下限：段平均速度 ≤ vmax
       double dtq = 0, dqa = 0;
