@@ -91,6 +91,41 @@ int main() {
       CHECK(peak[k] <= m.vmax[k] * 1.05 + 1e-6, "轴 %d 超速 %.3f", k, peak[k]);
   }
 
+  // ---- 3.5. 笛卡尔连续折线与圆弧插补 ----
+  {
+    auto m = ArmModel::urStyle();
+    std::array<double, 6> q0{0, -M_PI/4, M_PI/2, -M_PI/4, M_PI/2, 0};
+    Mat4 T0 = forwardKinematicsT0_6(m, q0);
+    Vec3 p0 = T0.translationV();
+
+    // 连续折线 (Blend Path)
+    Vec3 p1 = p0 + Vec3{-0.05, 0, 0};
+    Vec3 p2 = p1 + Vec3{0, 0, 0.05};
+    Mat4 T1 = T0; T1.m[3] = p1.x; T1.m[7] = p1.y; T1.m[11] = p1.z;
+    Mat4 T2 = T0; T2.m[3] = p2.x; T2.m[7] = p2.y; T2.m[11] = p2.z;
+    std::vector<Mat4> waypoints = {T0, T1, T2};
+    auto bTraj = cartesianBlendPathTraj(m, waypoints, q0, 0.02, 0.002, 0.15);
+    CHECK(!bTraj.empty(), "连续路径轨迹为空");
+    if (!bTraj.empty()) {
+      for (size_t i = 1; i < bTraj.ts.size(); i++) {
+        CHECK(bTraj.ts[i] > bTraj.ts[i - 1], "连续路径时间非严格单调");
+      }
+      Mat4 Tf_act = forwardKinematicsT0_6(m, bTraj.qs.back());
+      CHECK((Tf_act.translationV() - p2).norm() < 1e-3, "连续路径末端偏离预期");
+    }
+
+    // 圆弧轨迹
+    Vec3 center = p0 + Vec3{-0.1, 0, 0};
+    Vec3 normal{0, 0, 1};
+    auto cTraj = cartesianCircleTraj(m, center, normal, 0.1, 0, M_PI/2, T0, q0, 0.002, 0.15);
+    CHECK(!cTraj.empty(), "圆弧轨迹为空");
+    if (!cTraj.empty()) {
+      for (size_t i = 1; i < cTraj.ts.size(); i++) {
+        CHECK(cTraj.ts[i] > cTraj.ts[i - 1], "圆弧路径时间非严格单调");
+      }
+    }
+  }
+
   // ---- 4. 笛卡尔直线：FK 落在直线上 + 姿态 slerp ----
   {
     auto m = ArmModel::urStyle();
