@@ -19,6 +19,7 @@
     <h1>揽星 · Lyra</h1>
     <span class="sub">桌面 6 轴机械臂 · 实时 3D 控制台</span>
     <span id="conn" class="badge off">离线</span>
+    <span id="col-warn" class="badge off" style="margin-left: 8px; background: #ff5252;">碰撞警告</span>
   </header>
   <main>
     <section id="viewport"></section>
@@ -94,6 +95,15 @@
         <h2>抓取编排</h2>
         <button id="grasp-here">在当前末端位置执行抓取</button>
         <div class="hint">接近 → 下降 → 闭爪 → 上提</div>
+      </div>
+
+      <div class="card">
+        <h2>防碰撞测试</h2>
+        <div class="btn-row">
+          <button id="add-obstacle">在末端前方生成障碍</button>
+          <button id="clear-obstacles">清除障碍</button>
+        </div>
+        <div class="hint">自碰撞与环境碰撞由底层安全层兜底</div>
       </div>
 
       <div class="card danger">

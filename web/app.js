@@ -290,6 +290,29 @@ $('grasp-here').onclick = () => {
   const [x, y] = lastState.ee_pos;
   send({ type: 'grasp', pos: [x, y, 0.0], height: 0.05, approach: 0.1, grip_z: 0.03 });
 };
+
+// 障碍物管理
+const obstacles = [];
+const obsMat = new THREE.MeshBasicMaterial({ color: 0xff0000, transparent: true, opacity: 0.5 });
+$('add-obstacle').onclick = () => {
+  if (!lastState) return;
+  const pos = [...lastState.ee_pos];
+  // 放在末端正下方或者正前方
+  pos[2] -= 0.1;
+  const radius = 0.04;
+  send({ type: 'add_obstacle', pos, radius });
+
+  const mesh = new THREE.Mesh(new THREE.SphereGeometry(radius, 16, 16), obsMat);
+  mesh.position.set(...pos);
+  scene.add(mesh);
+  obstacles.push(mesh);
+};
+$('clear-obstacles').onclick = () => {
+  send({ type: 'clear_obstacles' });
+  for (const m of obstacles) scene.remove(m);
+  obstacles.length = 0;
+};
+
 $('estop').onclick = () => send({ type: 'estop', on: true });
 $('estop-clear').onclick = () => send({ type: 'estop', on: false });
 $('reset').onclick = () => send({ type: 'reset' });
@@ -332,6 +355,13 @@ function onState(m) {
     $('pp').value = m.ee_rpy[1].toFixed(3);
     $('pw').value = m.ee_rpy[2].toFixed(3);
   }
+
+  if (m.safety && m.safety.collision > 0) {
+    $('col-warn').className = 'badge on';
+  } else {
+    $('col-warn').className = 'badge off';
+  }
+
   renderRobot(m.q);
 }
 

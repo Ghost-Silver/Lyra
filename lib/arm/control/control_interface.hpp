@@ -30,6 +30,7 @@ struct StateSnapshot {
   int safVel = 0;           // 速度类（目标夹回 + 观测越限）
   int safAcc = 0;           // 加速度类
   int safStep = 0;          // 单拍跃变
+  int safCol = 0;           // 碰撞触发次数
   int safEstop = 0;         // 急停触发次数
   bool safEnabled = true;   // 监控层是否启用
 
@@ -56,6 +57,7 @@ struct StateSnapshot {
     saf.set("vel", json::Value(double(safVel)));
     saf.set("acc", json::Value(double(safAcc)));
     saf.set("step", json::Value(double(safStep)));
+    saf.set("collision", json::Value(double(safCol)));
     saf.set("estop", json::Value(double(safEstop)));
     v.set("safety", saf);
     json::Value jq = json::Value::array();

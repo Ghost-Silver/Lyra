@@ -182,6 +182,21 @@ int main() {
     sim2.injectFaultState(conf.home, v1);
     mon2.postStep(sim2, sim2.dt());
     CHECK(mon2.counters().accState == 1, "观测加速度越限未检出（计数=%d）", mon2.counters().accState);
+
+    // (e) 碰撞检测拦截
+    ArmSim simCol(conf, 0.002);
+    simCol.reset(conf.home);
+    SafetyMonitor monCol(m);
+    monCol.postStep(simCol, simCol.dt()); // base state
+
+    // Inject an obstacle directly inside the arm's home pose
+    auto frames = forwardKinematics(m, conf.home);
+    Vec3 p4 = frames[4].translationV(); // J4 origin
+    monCol.addObstacle({p4, 0.05}); // Obstacle overlaps with arm
+
+    bool estopReq = monCol.postStep(simCol, simCol.dt());
+    CHECK(monCol.counters().collision == 1, "碰撞未检出（计数=%d）", monCol.counters().collision);
+    CHECK(estopReq, "碰撞未请求急停");
   }
 
   // ================= B1：越限即急停（可选策略）=================

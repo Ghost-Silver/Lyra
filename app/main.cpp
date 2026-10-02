@@ -177,6 +177,12 @@ class Scheduler {
       exportDemo();
     } else if (type == "grasp") {
       startGrasp(c);
+    } else if (type == "add_obstacle") {
+      Vec3 center{c.get("pos").numAt(0), c.get("pos").numAt(1), c.get("pos").numAt(2)};
+      double radius = c.get("radius").asNumber(0.05);
+      safemon_.addObstacle({center, radius});
+    } else if (type == "clear_obstacles") {
+      safemon_.clearObstacles();
     } else {
       // 未知指令显式报错（不再静默丢弃——客户端必须能感知拼写/协议错误）
       json::Value v = json::Value::object();
@@ -209,6 +215,7 @@ class Scheduler {
     st.safVel = sc.velClamps + sc.velState;
     st.safAcc = sc.accState;
     st.safStep = sc.stepJump;
+    st.safCol = sc.collision;
     st.safEstop = sc.estopTriggers;
     st.safEnabled = safemon_.enabled();
     io.broadcastState(st);
