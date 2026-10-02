@@ -3,6 +3,7 @@
 //  + 关节滑杆 + 示教回放 + 抓取编排 + 急停。
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { TransformControls } from 'three/addons/controls/TransformControls.js';
 
 // ---------- DH 参数（与 lib/arm/kinematics.hpp 的 ArmModel::urStyle 保持一致）----------
 const D2R = Math.PI / 180;
@@ -140,12 +141,14 @@ for (let i = 0; i < 6; i++) {
 // 末端 TCP 坐标轴
 const tcpAxes = new THREE.AxesHelper(0.12);
 scene.add(tcpAxes);
-// 拖拽手柄
+// 拖拽手柄（为了和 TransformControls 共存可将其隐藏或保留作为指示器）
 const handle = new THREE.Mesh(
   new THREE.SphereGeometry(0.025, 20, 20),
   new THREE.MeshStandardMaterial({ color: 0x3ddc84, emissive: 0x0a3a22 })
 );
 scene.add(handle);
+handle.visible = false; // 由 TransformControls 的辅助线代替
+
 // 目标位姿虚影
 const ghost = new THREE.Mesh(
   new THREE.SphereGeometry(0.02, 16, 16),
@@ -207,7 +210,7 @@ const jointEls = [];
   }
 }
 const $ = (id) => document.getElementById(id);
-const speedEl = $('speed'), followEl = $('follow'), dragEl = $('drag-mode');
+const speedEl = $('speed'), followEl = $('follow');
 let qCmd = [0, -0.5, 0.5, 0, 0.5, 0];
 let lastJointSend = 0;
 
@@ -365,47 +368,65 @@ function onState(m) {
   renderRobot(m.q);
 }
 
-// ---------- 3D 拖拽末端（平移，姿态跟随）----------
-const ray = new THREE.Raycaster();
-const mouse = new THREE.Vector2();
-let dragging = false;
-const dragPlane = new THREE.Plane();
-const hitPt = new THREE.Vector3();
+// ---------- TransformControls 拖拽末端 (平移/旋转) ----------
+const tControl = new TransformControls(camera, renderer.domElement);
+// 我们将 tControl 绑定到 ghost 虚影上，通过拖拽 ghost 发送目标指令
+tControl.attach(ghost);
+scene.add(tControl.getHelper());
+tControl.enabled = false;
+tControl.visible = false;
 
-renderer.domElement.addEventListener('pointerdown', (ev) => {
-  if (!dragEl.checked || !lastState) return;
-  mouse.x = (ev.offsetX / renderer.domElement.clientWidth) * 2 - 1;
-  mouse.y = -(ev.offsetY / renderer.domElement.clientHeight) * 2 + 1;
-  ray.setFromCamera(mouse, camera);
-  const p = handle.position.clone();
-  const camDir = camera.getWorldDirection(new THREE.Vector3());
-  dragPlane.setFromNormalAndCoplanarPoint(camDir, p);
-  if (ray.ray.intersectPlane(dragPlane, hitPt)) {
-    dragging = true;
-    orbit.enabled = false;
-    ghost.visible = true;
+// 防止 orbitControls 和 transformControls 冲突
+tControl.addEventListener('dragging-changed', (event) => {
+  orbit.enabled = !event.value;
+  if (!event.value) {
+    // 拖拽结束时下发最后一次位置作为稳定目标
+    send({ type: 'joint_target', q: qCmd, speed: speed() });
   }
 });
-renderer.domElement.addEventListener('pointermove', (ev) => {
-  if (!dragging) return;
-  mouse.x = (ev.offsetX / renderer.domElement.clientWidth) * 2 - 1;
-  mouse.y = -(ev.offsetY / renderer.domElement.clientHeight) * 2 + 1;
-  ray.setFromCamera(mouse, camera);
-  if (ray.ray.intersectPlane(dragPlane, hitPt)) {
-    ghost.position.copy(hitPt);
-    // 姿态跟随当前
-    const rpy = lastState.ee_rpy;
-    send({ type: 'ee_drag', pos: [hitPt.x, hitPt.y, hitPt.z], rpy });
+
+tControl.addEventListener('change', () => {
+  if (tControl.dragging && lastState) {
+    const p = ghost.position;
+    const euler = new THREE.Euler().setFromQuaternion(ghost.quaternion, 'ZYX'); // RPY
+    // send ee_drag command
+    send({
+      type: 'ee_drag',
+      pos: [p.x, p.y, p.z],
+      rpy: [euler.x, euler.y, euler.z]
+    });
   }
 });
-window.addEventListener('pointerup', () => {
-  if (dragging) {
-    dragging = false;
-    orbit.enabled = true;
-    ghost.visible = false;
-    send({ type: 'joint_target', q: qCmd, speed: speed() }); // 落到最近构型
-  }
-});
+
+// UI 控制
+$('gizmo-off').onclick = () => {
+  tControl.enabled = false;
+  tControl.visible = false;
+  ghost.visible = false;
+};
+$('gizmo-trans').onclick = () => {
+  if (!lastState) return;
+  tControl.setMode('translate');
+  tControl.enabled = true;
+  tControl.visible = true;
+  ghost.visible = true;
+  // 同步 ghost 到当前位姿
+  const p = lastState.ee_pos;
+  const rpy = lastState.ee_rpy;
+  ghost.position.set(p[0], p[1], p[2]);
+  ghost.quaternion.setFromEuler(new THREE.Euler(rpy[0], rpy[1], rpy[2], 'ZYX'));
+};
+$('gizmo-rot').onclick = () => {
+  if (!lastState) return;
+  tControl.setMode('rotate');
+  tControl.enabled = true;
+  tControl.visible = true;
+  ghost.visible = true;
+  const p = lastState.ee_pos;
+  const rpy = lastState.ee_rpy;
+  ghost.position.set(p[0], p[1], p[2]);
+  ghost.quaternion.setFromEuler(new THREE.Euler(rpy[0], rpy[1], rpy[2], 'ZYX'));
+};
 
 // ---------- 主渲染循环 ----------
 function resize() {

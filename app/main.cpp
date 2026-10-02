@@ -518,6 +518,7 @@ int main(int argc, char** argv) {
   WsServer ws(port, webRoot);
   if (!allowOrigins.empty()) ws.setOriginAllowlist(std::move(allowOrigins));   // 空 = 放行所有
   if (!authToken.empty()) ws.setAuthToken(authToken);                          // 设置 HTTP/WS 认证 token
+  ws.enableAuditLog();                                                         // 开启安全审计日志
   // 串口（真机路径）先建立，便于 /api/health 暴露其在线/队列/丢弃计数
   std::unique_ptr<SerialDriver> serial;
   if (!serialDev.empty()) {

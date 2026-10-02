@@ -59,7 +59,11 @@
 
       <div class="card">
         <h2>末端控制</h2>
-        <label class="row"><input type="checkbox" id="drag-mode" /> 3D 拖拽末端（平移，姿态跟随）</label>
+        <div class="btn-row" style="margin-bottom: 8px;">
+          <button id="gizmo-off">关闭拖拽</button>
+          <button id="gizmo-trans">开启平移拖拽</button>
+          <button id="gizmo-rot">开启旋转拖拽</button>
+        </div>
         <div class="pose-inputs">
           <label>X <input id="px" type="number" step="0.01" /></label>
           <label>Y <input id="py" type="number" step="0.01" /></label>
