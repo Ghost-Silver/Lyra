@@ -181,6 +181,7 @@ class WsServer : public ControlInterface {
   ~WsServer() override {
     for (auto& c : clients_) if (c.fd >= 0) ::close(c.fd);
     if (listenFd_ >= 0) ::close(listenFd_);
+    if (auditLog_) fclose(auditLog_);
   }
 
   bool begin() override {
@@ -205,6 +206,13 @@ class WsServer : public ControlInterface {
 
   // P1-7：Origin 白名单（空 = 放行所有；设置后须精确匹配，"*" 条目通配）
   void setOriginAllowlist(std::vector<std::string> allow) { allowedOrigins_ = std::move(allow); }
+  // 认证 Token 设置（非空时将对 HTTP 和 WS 握手拦截，检查 Authorization 或 ?token=）
+  void setAuthToken(std::string token) { authToken_ = std::move(token); }
+  // 开启审计日志
+  void enableAuditLog(const std::string& path = "audit.log") {
+    if (auditLog_) fclose(auditLog_);
+    auditLog_ = fopen(path.c_str(), "a");
+  }
   // 健康检查扩展钩子：宿主可注入额外字段（如安全层计数），保持 ws_server 与业务解耦
   void setHealthExtra(std::function<void(json::Value&)> fn) { healthExtra_ = std::move(fn); }
 
@@ -287,6 +295,9 @@ class WsServer : public ControlInterface {
     uint8_t fragOp = 0;
     std::string outBuf;            // 待发送字节（有界队列，非阻塞冲刷）
     Clock::time_point lastAct;     // 最近一次收字节时刻（slowloris 超时用）
+
+    double tokenBucket = 100.0;    // Rate limiter tokens (e.g. 100 frames/sec)
+    Clock::time_point lastTokenUpdate;
   };
   // 全局限额（DoS 面收敛）
   static constexpr size_t kMaxClients = 16;        // 连接数上限
@@ -340,6 +351,8 @@ class WsServer : public ControlInterface {
       Client c;
       c.fd = fd;
       c.lastAct = Clock::now();
+      c.lastTokenUpdate = c.lastAct;
+      c.tokenBucket = 100.0;
       clients_.push_back(c);
     }
   }
@@ -418,6 +431,45 @@ class WsServer : public ControlInterface {
     c.buf.clear();
 
     if (method != "GET") { respond(c, "405 Method Not Allowed", "text/plain", "GET only"); c.alive = false; return; }
+
+    // P1：认证 Token 校验
+    // 只拦截 WS 升级和 /api/ 接口；静态文件放行，以便 UI 加载
+    bool isApiOrWs = (path.find("/api") == 0) || (path.find("/ws") == 0) || (hdr.count("upgrade") > 0);
+    if (!authToken_.empty() && isApiOrWs) {
+      bool authOk = false;
+      // 1. 检查 Authorization: Bearer <token>
+      auto auth = hdr.find("authorization");
+      if (auth != hdr.end()) {
+        std::string v = auth->second;
+        if (v.size() > 7 && v.substr(0, 7) == "Bearer ") {
+          if (v.substr(7) == authToken_) authOk = true;
+        }
+      }
+      // 2. 检查 Query Param: ?token=<token>
+      if (!authOk) {
+        size_t q = path.find("?token=");
+        if (q != std::string::npos) {
+          std::string tokenInUrl = path.substr(q + 7);
+          size_t amp = tokenInUrl.find('&');
+          if (amp != std::string::npos) tokenInUrl = tokenInUrl.substr(0, amp);
+          if (tokenInUrl == authToken_) {
+            authOk = true;
+          }
+          // strip token from path for subsequent serving
+          path = path.substr(0, q);
+        }
+      }
+
+      if (!authOk) {
+        respond(c, "401 Unauthorized", "text/plain", "unauthorized");
+        c.alive = false;
+        return;
+      }
+    }
+
+    // 去除 path 上的查询参数 (如果存在其他参数)
+    size_t qmark = path.find('?');
+    if (qmark != std::string::npos) path = path.substr(0, qmark);
 
     // WS 升级（握手三件套校验：Connection: Upgrade / Version: 13 / Key 合法）
     auto up = hdr.find("upgrade");
@@ -620,8 +672,28 @@ class WsServer : public ControlInterface {
           return;
         case wsutil::kText:
         case wsutil::kBinary: {
+          auto now = Clock::now();
+          std::chrono::duration<double> dt = now - c.lastTokenUpdate;
+          c.lastTokenUpdate = now;
+          c.tokenBucket += dt.count() * 100.0; // refill 100 tokens per sec
+          if (c.tokenBucket > 200.0) c.tokenBucket = 200.0;
+          if (c.tokenBucket < 1.0) {
+            c.alive = false; // Rate limit exceeded
+            return;
+          }
+          c.tokenBucket -= 1.0;
+
           json::Value v;
-          if (json::Value::parse(payload, v) && v.isObject()) inbox_.push_back(std::move(v));
+          if (json::Value::parse(payload, v) && v.isObject()) {
+            if (auditLog_) {
+               std::string typ = v.has("type") ? v.get("type").asString() : "unknown";
+               if (typ != "state" && typ != "ping" && typ != "pong") {
+                   fprintf(auditLog_, "[%ld] AUDIT %s\n", (long)std::time(nullptr), payload.c_str());
+                   fflush(auditLog_);
+               }
+            }
+            inbox_.push_back(std::move(v));
+          }
           break;
         }
         default:
@@ -635,6 +707,7 @@ class WsServer : public ControlInterface {
   std::string webRoot_;
   std::string rootReal_;
   std::vector<std::string> allowedOrigins_;
+  std::string authToken_;
   int listenFd_ = -1;
   std::vector<Client> clients_;
   std::vector<json::Value> inbox_;
@@ -644,6 +717,7 @@ class WsServer : public ControlInterface {
   size_t rejectedClients_ = 0;                        // C2：连接数超限被拒计数
   size_t headerRejects_ = 0;                          // C2：超长请求头丢弃计数
   std::function<void(json::Value&)> healthExtra_;     // /api/health 扩展字段
+  FILE* auditLog_ = nullptr;                          // 安全审计日志
 };
 
 }  // namespace arm

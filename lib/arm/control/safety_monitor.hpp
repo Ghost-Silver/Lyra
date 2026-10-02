@@ -10,6 +10,7 @@
 // header-only，仅依赖 robot_conf.hpp 与 sim.hpp 的公开接口。
 #pragma once
 #include "arm/sim.hpp"
+#include "arm/collision.hpp"
 
 #include <algorithm>
 #include <array>
@@ -26,8 +27,9 @@ struct SafetyCounters {
   int velState = 0;       // 积分后：观测 |qd| > vmax
   int accState = 0;       // 积分后：观测 |Δqd|/dt > amax
   int stepJump = 0;       // 积分后：单拍位置跃变（时间基准失效类 bug 的特征）
+  int collision = 0;      // 积分后：碰撞检测触发次数
   int estopTriggers = 0;  // 触发急停锁存次数
-  int total() const { return posClamps + velClamps + posState + velState + accState + stepJump; }
+  int total() const { return posClamps + velClamps + posState + velState + accState + stepJump + collision; }
 };
 
 class SafetyMonitor {
@@ -38,6 +40,7 @@ class SafetyMonitor {
     double stepFactor = 1.5;        // 单拍位移上限 = vmax·dt·stepFactor（理论上限 1.0 的余量）
     double velTol = 1.001;          // 观测速度容差（浮点松弛）
     double accTol = 1.05;           // 观测加速度容差
+    double collisionMargin = 0.01;  // 碰撞安全余量 (m)
   };
 
   explicit SafetyMonitor(const ArmModel& arm) : arm_(arm) {}
@@ -48,6 +51,11 @@ class SafetyMonitor {
   void setEstopOnViolation(bool on) { cfg_.estopOnViolation = on; }
   const Config& config() const { return cfg_; }
   const SafetyCounters& counters() const { return cnt_; }
+
+  // 障碍物管理
+  void addObstacle(const Sphere& s) { obstacles_.push_back(s); }
+  void clearObstacles() { obstacles_.clear(); }
+  const std::vector<Sphere>& obstacles() const { return obstacles_; }
 
   // 独立拦截入口（不经过任何规划器）：把越限目标夹回安全域；返回 true = 发生拦截。
   // 供 preDispatch 使用，也供真机派发层/测试直接调用。
@@ -151,6 +159,25 @@ class SafetyMonitor {
       }
     }
 
+    // (d) 碰撞检测 (自碰撞与环境障碍物)
+    auto caps = buildArmCollisionModel(arm_, st2.q);
+    bool collides = checkSelfCollision(caps, cfg_.collisionMargin);
+    if (!collides) {
+      for (const auto& cap : caps) {
+        for (const auto& obs : obstacles_) {
+          if (checkCapsuleSphereCollision(cap, obs, cfg_.collisionMargin)) {
+            collides = true; break;
+          }
+        }
+        if (collides) break;
+      }
+    }
+    if (collides) {
+      cnt_.collision++;
+      if (havePrev_) sim.applySafetyClamp(qPrev_, true); // 碰撞回滚到上一安全拍
+      estop = true; // 碰撞必须触发急停锁存
+    }
+
     qPrev_ = sim.state().q;
     qdPrev_ = sim.state().qd;
     havePrev_ = true;
@@ -175,6 +202,7 @@ class SafetyMonitor {
   SafetyCounters cnt_;
   std::array<double, 6> qPrev_{}, qdPrev_{};
   bool havePrev_ = false;
+  std::vector<Sphere> obstacles_; // 环境中的球形障碍物
 };
 
 }  // namespace arm

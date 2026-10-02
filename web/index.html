@@ -19,6 +19,7 @@
     <h1>揽星 · Lyra</h1>
     <span class="sub">桌面 6 轴机械臂 · 实时 3D 控制台</span>
     <span id="conn" class="badge off">离线</span>
+    <span id="col-warn" class="badge off" style="margin-left: 8px; background: #ff5252;">碰撞警告</span>
   </header>
   <main>
     <section id="viewport"></section>
@@ -38,6 +39,18 @@
       </div>
 
       <div class="card">
+        <h2>前馈力矩 (动力学)</h2>
+        <div id="torques-grid" style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; font-size: 13px; text-align: center;">
+          <div>J1: <span id="tau1">0.0</span></div>
+          <div>J2: <span id="tau2">0.0</span></div>
+          <div>J3: <span id="tau3">0.0</span></div>
+          <div>J4: <span id="tau4">0.0</span></div>
+          <div>J5: <span id="tau5">0.0</span></div>
+          <div>J6: <span id="tau6">0.0</span></div>
+        </div>
+      </div>
+
+      <div class="card">
         <h2>关节滑杆</h2>
         <div id="joints"></div>
         <label>速度倍率 <input type="range" id="speed" min="0.05" max="1" step="0.05" value="0.4" /><span id="speed-v">0.40</span></label>
@@ -46,7 +59,11 @@
 
       <div class="card">
         <h2>末端控制</h2>
-        <label class="row"><input type="checkbox" id="drag-mode" /> 3D 拖拽末端（平移，姿态跟随）</label>
+        <div class="btn-row" style="margin-bottom: 8px;">
+          <button id="gizmo-off">关闭拖拽</button>
+          <button id="gizmo-trans">开启平移拖拽</button>
+          <button id="gizmo-rot">开启旋转拖拽</button>
+        </div>
         <div class="pose-inputs">
           <label>X <input id="px" type="number" step="0.01" /></label>
           <label>Y <input id="py" type="number" step="0.01" /></label>
@@ -55,7 +72,14 @@
           <label>P <input id="pp" type="number" step="0.05" /></label>
           <label>Y <input id="pw" type="number" step="0.05" /></label>
         </div>
-        <button id="go-ee">移动到该位姿</button>
+        <div class="btn-row">
+          <button id="go-ee">IK移动(PTP)</button>
+          <button id="go-ee-line">直线插补(Line)</button>
+        </div>
+        <div class="btn-row">
+          <button id="demo-circle">圆弧演示(Circle)</button>
+          <button id="demo-path">连续折线演示(Blend)</button>
+        </div>
         <label>夹爪 <input type="range" id="grip" min="0" max="1" step="0.01" value="0" /></label>
       </div>
 
@@ -75,6 +99,15 @@
         <h2>抓取编排</h2>
         <button id="grasp-here">在当前末端位置执行抓取</button>
         <div class="hint">接近 → 下降 → 闭爪 → 上提</div>
+      </div>
+
+      <div class="card">
+        <h2>防碰撞测试</h2>
+        <div class="btn-row">
+          <button id="add-obstacle">在末端前方生成障碍</button>
+          <button id="clear-obstacles">清除障碍</button>
+        </div>
+        <div class="hint">自碰撞与环境碰撞由底层安全层兜底</div>
       </div>
 
       <div class="card danger">
