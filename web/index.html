@@ -38,6 +38,18 @@
       </div>
 
       <div class="card">
+        <h2>前馈力矩 (动力学)</h2>
+        <div id="torques-grid" style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; font-size: 13px; text-align: center;">
+          <div>J1: <span id="tau1">0.0</span></div>
+          <div>J2: <span id="tau2">0.0</span></div>
+          <div>J3: <span id="tau3">0.0</span></div>
+          <div>J4: <span id="tau4">0.0</span></div>
+          <div>J5: <span id="tau5">0.0</span></div>
+          <div>J6: <span id="tau6">0.0</span></div>
+        </div>
+      </div>
+
+      <div class="card">
         <h2>关节滑杆</h2>
         <div id="joints"></div>
         <label>速度倍率 <input type="range" id="speed" min="0.05" max="1" step="0.05" value="0.4" /><span id="speed-v">0.40</span></label>

@@ -21,6 +21,7 @@ struct StateSnapshot {
   double sigmaMin = 0;      // σ_min(J) 原始值
   double sigIdx = 0;        // 无量纲奇异指标 η=σ_min/σ_max ∈ (0,1]（前端画表）
   double manip = 0;         // 可操控度
+  std::array<double, 6> tau_ff{}; // 动力学前馈力矩（RNEA）
   std::string mode;         // idle / ptp / cartesian / teach / grasp ...
   int teachCount = 0;
   // 安全监控层计数（B1）：独立终检的越限拦截/审计结果，可观测
@@ -43,6 +44,11 @@ struct StateSnapshot {
     v.set("sig_idx", json::Value(sigIdx));
     v.set("manip", json::Value(manip));
     v.set("teach_count", json::Value(double(teachCount)));
+
+    json::Value jtau = json::Value::array();
+    for (int i = 0; i < 6; i++) jtau.pushBack(json::Value(tau_ff[i]));
+    v.set("tau_ff", std::move(jtau));
+
     json::Value saf = json::Value::object();
     saf.set("enabled", json::Value(safEnabled));
     saf.set("total", json::Value(double(safTotal)));

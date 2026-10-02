@@ -8,6 +8,7 @@
 //         固定归一化（保证可复现）。
 #pragma once
 #include "arm/robot_conf.hpp"
+#include "arm/dynamics.hpp"
 #include "arm/kinematics.hpp"
 #include <array>
 #include <cmath>
@@ -83,8 +84,9 @@ class ArmSim {
       if (std::abs(v) < 1e-4 && tauD <= conf_.fric.stic[i]) vEff = 0.0;   // 静摩擦粘滞
       st_.qd[i] += std::clamp(vEff - st_.qd[i], -dv, dv);
     }
-    // 负载重力补偿钩子：速度前馈扰动（真机为力矩前馈，仿真以柔性扰动体现）
-    st_.tau_ff = conf_.gravityCompTorque(st_.q);
+    // 动力学前馈补偿（RNEA）：速度前馈扰动（真机为真实驱动力矩前馈，仿真以柔性扰动体现）
+    // 替代了旧的仅含负载重力补偿的 gravityCompTorque，现在包含完整的连杆刚体动力学。
+    st_.tau_ff = inverseDynamics(conf_.arm, st_.q, st_.qd, {0,0,0,0,0,0});
     for (int i = 0; i < 6; i++) {
       double disturb = 1e-4 * st_.tau_ff[i];        // 柔性负载效应
       st_.q[i] += (st_.qd[i] + disturb) * dt_;

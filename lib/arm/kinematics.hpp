@@ -145,15 +145,23 @@ inline Mat4 rotationSlerp(const Mat4& A, const Mat4& B, double s) {
   return Arot * Mat4::rotationAxisAngle(axis, ang * s);
 }
 
-// ---------- DH 参数（标准 DH） ----------
+// ---------- DH 参数与刚体动力学参数 ----------
 struct LinkDH {
   double a = 0, alpha = 0, d = 0;  // a: 连杆长, alpha: 扭转(°), d: 偏置
   double thetaOffset = 0;          // 零位偏置 (rad)
 };
 
+// 连杆刚体动力学参数 (质心与惯性张量定义在连杆本征系 Link Frame i)
+struct LinkDynamics {
+  double m = 0;            // 质量 (kg)
+  Vec3 com{0, 0, 0};       // 质心在连杆系 i 中的坐标 (m)
+  double Ixx = 0, Iyy = 0, Izz = 0; // 对质心的惯性主矩 (kg·m²)，假设惯性积为 0 以简化
+};
+
 // 一个桌面 6 轴的机械臂模型（UR 风格几何）
 struct ArmModel {
   std::array<LinkDH, 6> links{};
+  std::array<LinkDynamics, 6> dyna{};     // 刚体动力学参数
   std::array<double, 6> qmin{}, qmax{};   // 关节限位 (rad)
   std::array<double, 6> vmax{};           // 关节最大速度 (rad/s)
 
@@ -165,6 +173,14 @@ struct ArmModel {
     m.links[3] = {0.000,  90, 0.1333, 0.0};
     m.links[4] = {0.000, -90, 0.0997, 0.0};
     m.links[5] = {0.000,   0, 0.0996, 0.0};
+    // 近似桌面级机械臂动力学参数 (典型值)
+    m.dyna[0] = {2.0, {0, -0.02, 0.05}, 0.01, 0.01, 0.01};
+    m.dyna[1] = {4.5, {-0.2, 0, 0.08},  0.05, 0.01, 0.05};
+    m.dyna[2] = {3.0, {-0.2, 0, 0.05},  0.03, 0.01, 0.03};
+    m.dyna[3] = {1.2, {0, -0.01, 0.04}, 0.005, 0.005, 0.005};
+    m.dyna[4] = {1.0, {0, 0.01, 0.04},  0.003, 0.003, 0.003};
+    m.dyna[5] = {0.5, {0, 0, 0.02},     0.001, 0.001, 0.001};
+
     for (int i = 0; i < 6; i++) {
       m.qmin[i] = -2.967; m.qmax[i] = 2.967;
       m.vmax[i] = 2.5;

@@ -72,7 +72,9 @@ struct RobotConf {
     }
     for (int j = 0; j < 6; j++) {
       Vec3 lv = axes[j].cross(comW - pos[j]);
-      tau[j] = lv.dot(F);
+      // lv.dot(F) 是重力作用在关节上的力矩。前馈补偿应为相反数。
+      // 与刚体动力学（RNEA）引擎的输出语义（驱动前馈力矩）统一。
+      tau[j] = -lv.dot(F);
     }
     return tau;
   }

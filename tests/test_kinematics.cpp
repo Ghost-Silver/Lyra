@@ -2,6 +2,8 @@
 // 覆盖：FK 已知位形、齐次矩阵末行回归（历史 bug）、θ1 解耦方程、
 // 解析 IK 8 分支往返、数值 IK 回归、雅可比数值校验、σ_min/可操控度、位姿误差公式。
 #include "arm/kinematics.hpp"
+#include "arm/dynamics.hpp"
+#include "arm/robot_conf.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <random>
@@ -219,7 +221,41 @@ int main(int argc, char** argv) {
     CHECK(sc < 0.5 && sc >= 0.2, "奇异软降速系数 %.2f", sc);
   }
 
-  // ---- 10. η 分布统计（README「奇异软降速」数字的复现入口；固定 seed 可复现）----
+  // ---- 10. 刚体动力学 (RNEA) 一致性验证 ----
+  {
+    RobotConf conf = RobotConf::desktop6();
+    conf.payload.mass = 0.5; // 设置测试负载
+    std::array<double, 6> q = {0.1, -0.2, 0.3, -0.4, 0.5, -0.6};
+
+    // RNEA 静态前馈 (重力补偿) 验证
+    auto dyna_arm = conf.arm;
+    for(int i=0; i<6; i++) dyna_arm.dyna[i].m = 0;
+    dyna_arm.dyna[5].m = conf.payload.mass;
+    dyna_arm.dyna[5].com = conf.tool.transformPoint(conf.payload.comTool);
+
+    auto tau_rnea = inverseDynamics(dyna_arm, q, {0,0,0,0,0,0}, {0,0,0,0,0,0});
+    auto tau_grav = conf.gravityCompTorque(q);
+
+    for(int i=0; i<6; i++) {
+      CHECK(std::abs(tau_rnea[i] - tau_grav[i]) < 1e-6, "RNEA 静态重力补偿误差过大 (J%d: RNEA=%.4f vs Grav=%.4f)", i, tau_rnea[i], tau_grav[i]);
+    }
+
+    // RNEA 动态非全零响应验证
+    dyna_arm = conf.arm;
+    std::array<double, 6> qd = {1, 2, -1, 0.5, -0.5, 3};
+    std::array<double, 6> qdd = {-2, 1, 3, -1, 2, -1};
+    auto tau_dyn = inverseDynamics(dyna_arm, q, qd, qdd);
+
+    auto tau_stat = inverseDynamics(dyna_arm, q, {0,0,0,0,0,0}, {0,0,0,0,0,0});
+    double diff_norm = 0;
+    for(int i=0; i<6; i++) {
+      double d = tau_dyn[i] - tau_stat[i];
+      diff_norm += d*d;
+    }
+    CHECK(diff_norm > 1.0, "RNEA 未产生显著的动态惯性响应");
+  }
+
+  // ---- 11. η 分布统计（README「奇异软降速」数字的复现入口；固定 seed 可复现）----
   // 采样：各关节在**限位内**均匀（真实可达构型），3000 个位形。
   if (etaStats) {
     const int N = 3000;

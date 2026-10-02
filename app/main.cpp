@@ -200,6 +200,7 @@ class Scheduler {
     st.sigmaMin = minSingularValue(conf_.arm, st.q);
     st.sigIdx = singularityIndex(conf_.arm, st.q);
     st.manip = manipulability(conf_.arm, st.q);
+    st.tau_ff = sim_.state().tau_ff;
     st.mode = modeName();
     st.teachCount = int(teach_.size());
     const auto& sc = safemon_.counters();

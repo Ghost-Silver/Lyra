@@ -301,6 +301,13 @@ function onState(m) {
   $('st-ee').textContent = m.ee_pos.map((v) => v.toFixed(3)).join(', ');
   $('st-rpy').textContent = m.ee_rpy.map((v) => v.toFixed(2)).join(', ');
   $('teach-n').textContent = m.teach_count;
+
+  if (m.tau_ff) {
+    for (let i = 0; i < 6; i++) {
+      const el = $(`tau${i+1}`);
+      if (el) el.textContent = m.tau_ff[i].toFixed(2);
+    }
+  }
   // 奇异度条（无量纲 η = σ_min/σ_max，本臂正常域约 0.02~0.25）
   const s0 = m.sig_idx ?? 0;
   const bar = $('sig-bar');
